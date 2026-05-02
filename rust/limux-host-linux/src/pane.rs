@@ -159,7 +159,7 @@ type PaneSplitCallback = dyn Fn(&gtk::Widget, gtk::Orientation);
 type PaneWidgetCallback = dyn Fn(&gtk::Widget);
 type PaneSignalCallback = dyn Fn();
 type PanePathCallback = dyn Fn(&str);
-type PaneDesktopNotificationCallback = dyn Fn(&str, &str);
+type PaneDesktopNotificationCallback = dyn Fn(&str, &str, bool, u32, &str);
 type PaneEmptyCallback = dyn Fn(&gtk::Widget, PaneEmptyReason);
 type PaneOpenBrowserHereCallback = dyn Fn(&gtk::Widget);
 type PaneShortcutStateCallback = dyn Fn() -> Rc<ResolvedShortcutConfig>;
@@ -640,6 +640,30 @@ pub fn focus_active_tab_in_pane(pane_widget: &gtk::Widget) -> bool {
     true
 }
 
+pub fn activate_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return false;
+    };
+
+    let has_tab = internals
+        .tab_state
+        .borrow()
+        .tabs
+        .iter()
+        .any(|entry| entry.id == tab_id);
+    if !has_tab {
+        return false;
+    }
+
+    activate_tab(
+        &internals.tab_strip,
+        &internals.content_stack,
+        &internals.tab_state,
+        tab_id,
+    );
+    true
+}
+
 fn normalize_surface_hint(raw: &str) -> &str {
     raw.trim()
         .strip_prefix("surface:")
@@ -953,6 +977,8 @@ fn make_terminal_callbacks(
     let pane_outer = internals.pane_outer.clone();
     let term_cwd_for_pwd = term_cwd.clone();
     let tid_for_close = tab_id.to_string();
+    let tid_for_notification = tab_id.to_string();
+    let pane_id = internals.pane_id;
 
     TerminalCallbacks {
         on_title_changed: Box::new(move |title: &str| {
@@ -978,8 +1004,9 @@ fn make_terminal_callbacks(
         }),
         on_desktop_notification: Box::new({
             let callbacks = internals.callbacks.clone();
-            move |title: &str, body: &str| {
-                (callbacks.on_desktop_notification)(title, body);
+            let tab_id = tid_for_notification.clone();
+            move |title: &str, body: &str, source_focused: bool| {
+                (callbacks.on_desktop_notification)(title, body, source_focused, pane_id, &tab_id);
             }
         }),
         on_bell: Box::new(move || {

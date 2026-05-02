@@ -14,7 +14,7 @@ use adw::prelude::*;
 use libadwaita as adw;
 use std::path::{Path, PathBuf};
 
-const APP_ID: &str = "dev.limux.linux";
+pub(crate) const APP_ID: &str = "dev.limux.linux";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Append a value to an environment variable (comma-separated), or set it.

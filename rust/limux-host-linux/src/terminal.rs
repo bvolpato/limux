@@ -35,7 +35,7 @@ static WAKEUP_IDLE_QUEUED: AtomicBool = AtomicBool::new(false);
 
 type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
-type DesktopNotificationCallback = dyn Fn(&str, &str);
+type DesktopNotificationCallback = dyn Fn(&str, &str, bool);
 type VoidCallback = dyn Fn();
 type WidgetCallback = dyn Fn(&gtk::Widget);
 
@@ -537,7 +537,7 @@ unsafe extern "C" fn ghostty_action_cb(
                 SURFACE_MAP.with(|map| {
                     if let Some(entry) = map.borrow().get(&surface_key) {
                         if let Some(cb) = &entry.on_desktop_notification {
-                            cb(&title, &body);
+                            cb(&title, &body, entry.gl_area.is_focus());
                         }
                     }
                 });
@@ -1046,9 +1046,9 @@ pub fn create_terminal(
                         })),
                         on_desktop_notification: Some(Box::new({
                             let cb = callbacks.clone();
-                            move |title, body| {
+                            move |title, body, source_focused| {
                                 let callbacks = cb.borrow();
-                                (callbacks.on_desktop_notification)(title, body);
+                                (callbacks.on_desktop_notification)(title, body, source_focused);
                             }
                         })),
                         on_bell: Some(Box::new({

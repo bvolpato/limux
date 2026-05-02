@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -75,9 +76,13 @@ pub(crate) struct AppState {
     persistence_suspended: bool,
     save_queued: bool,
     workspace_dragging: Option<String>,
+    desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
     _theme_portal_signal: Option<gio::SignalSubscription>,
     _theme_gnome_settings: Option<gio::Settings>,
     _theme_gnome_signal: Option<glib::SignalHandlerId>,
+    _desktop_notification_token_signal: Option<gio::SignalSubscription>,
+    _desktop_notification_action_signal: Option<gio::SignalSubscription>,
+    _desktop_notification_closed_signal: Option<gio::SignalSubscription>,
 }
 
 impl AppState {
@@ -174,8 +179,13 @@ const PORTAL_DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
 const PORTAL_SETTINGS_INTERFACE: &str = "org.freedesktop.portal.Settings";
 const PORTAL_APPEARANCE_NAMESPACE: &str = "org.freedesktop.appearance";
 const PORTAL_COLOR_SCHEME_KEY: &str = "color-scheme";
+const FREEDESKTOP_NOTIFICATIONS_SERVICE: &str = "org.freedesktop.Notifications";
+const FREEDESKTOP_NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
+const FREEDESKTOP_NOTIFICATIONS_INTERFACE: &str = "org.freedesktop.Notifications";
 const GNOME_INTERFACE_SCHEMA: &str = "org.gnome.desktop.interface";
 const GNOME_COLOR_SCHEME_KEY: &str = "color-scheme";
+const DESKTOP_NOTIFICATION_DBUS_TIMEOUT_MS: i32 = 1_000;
+const DESKTOP_NOTIFICATION_EXPIRE_TIMEOUT_MS: i32 = 10_000;
 const PORTAL_THEME_READ_TIMEOUT_MS: i32 = 500;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -185,6 +195,27 @@ enum PortalColorSchemePreference {
     Default,
     Dark,
     Light,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DesktopNotificationTarget {
+    workspace_id: String,
+    pane_id: Option<u32>,
+    tab_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DesktopNotificationRoute {
+    target: DesktopNotificationTarget,
+    activation_token: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DesktopNotificationRequest {
+    summary: String,
+    body: String,
+    sound: app_config::NotificationSound,
+    target: DesktopNotificationTarget,
 }
 
 impl PortalColorSchemePreference {
@@ -946,9 +977,13 @@ pub fn build_window(app: &adw::Application) {
         persistence_suspended: false,
         save_queued: false,
         workspace_dragging: None,
+        desktop_notification_routes: HashMap::new(),
         _theme_portal_signal: None,
         _theme_gnome_settings: None,
         _theme_gnome_signal: None,
+        _desktop_notification_token_signal: None,
+        _desktop_notification_action_signal: None,
+        _desktop_notification_closed_signal: None,
     }));
     CONTROL_STATE.with(|slot| {
         *slot.borrow_mut() = Some(state.clone());
@@ -987,6 +1022,7 @@ pub fn build_window(app: &adw::Application) {
         system_prefers_dark.clone(),
         portal_color_scheme_preference.clone(),
     );
+    connect_desktop_notification_watch_async(state.clone());
 
     apply_shortcuts_to_application(app, &state.borrow().shortcuts);
 
@@ -1790,6 +1826,228 @@ fn connect_portal_appearance_watch(
             );
         },
     ))
+}
+
+fn connect_desktop_notification_watch_async(state: State) {
+    gio::DBusProxy::for_bus(
+        gio::BusType::Session,
+        gio::DBusProxyFlags::NONE,
+        None::<&gio::DBusInterfaceInfo>,
+        FREEDESKTOP_NOTIFICATIONS_SERVICE,
+        FREEDESKTOP_NOTIFICATIONS_PATH,
+        FREEDESKTOP_NOTIFICATIONS_INTERFACE,
+        None::<&gio::Cancellable>,
+        move |result| {
+            let Ok(proxy) = result else {
+                return;
+            };
+
+            let token_subscription =
+                connect_desktop_notification_token_watch(&proxy, state.clone());
+            let action_subscription =
+                connect_desktop_notification_action_watch(&proxy, state.clone());
+            let closed_subscription =
+                connect_desktop_notification_closed_watch(&proxy, state.clone());
+            let mut s = state.borrow_mut();
+            s._desktop_notification_token_signal = token_subscription;
+            s._desktop_notification_action_signal = action_subscription;
+            s._desktop_notification_closed_signal = closed_subscription;
+        },
+    );
+}
+
+fn desktop_notification_id_from_response(response: &glib::Variant) -> Option<u32> {
+    response
+        .try_child_get::<u32>(0)
+        .ok()
+        .flatten()
+        .or_else(|| response.try_get::<u32>().ok())
+}
+
+fn desktop_notification_action_from_signal(parameters: &glib::Variant) -> Option<(u32, String)> {
+    parameters.try_get::<(u32, String)>().ok()
+}
+
+fn desktop_notification_activation_token_from_signal(
+    parameters: &glib::Variant,
+) -> Option<(u32, String)> {
+    parameters.try_get::<(u32, String)>().ok()
+}
+
+fn desktop_notification_closed_id_from_signal(parameters: &glib::Variant) -> Option<u32> {
+    parameters.try_get::<(u32, u32)>().ok().map(|(id, _)| id)
+}
+
+fn connect_desktop_notification_token_watch(
+    proxy: &gio::DBusProxy,
+    state: State,
+) -> Option<gio::SignalSubscription> {
+    let connection = proxy.connection();
+    Some(connection.subscribe_to_signal(
+        Some(FREEDESKTOP_NOTIFICATIONS_SERVICE),
+        Some(FREEDESKTOP_NOTIFICATIONS_INTERFACE),
+        Some("ActivationToken"),
+        Some(FREEDESKTOP_NOTIFICATIONS_PATH),
+        None,
+        gio::DBusSignalFlags::NONE,
+        move |signal| {
+            let Some((notification_id, activation_token)) =
+                desktop_notification_activation_token_from_signal(signal.parameters)
+            else {
+                return;
+            };
+
+            let mut s = state.borrow_mut();
+            if let Some(route) = s.desktop_notification_routes.get_mut(&notification_id) {
+                route.activation_token = Some(activation_token);
+            }
+        },
+    ))
+}
+
+fn connect_desktop_notification_action_watch(
+    proxy: &gio::DBusProxy,
+    state: State,
+) -> Option<gio::SignalSubscription> {
+    let connection = proxy.connection();
+    Some(connection.subscribe_to_signal(
+        Some(FREEDESKTOP_NOTIFICATIONS_SERVICE),
+        Some(FREEDESKTOP_NOTIFICATIONS_INTERFACE),
+        Some("ActionInvoked"),
+        Some(FREEDESKTOP_NOTIFICATIONS_PATH),
+        None,
+        gio::DBusSignalFlags::NONE,
+        move |signal| {
+            let Some((notification_id, action_key)) =
+                desktop_notification_action_from_signal(signal.parameters)
+            else {
+                return;
+            };
+
+            if action_key != "default" {
+                return;
+            }
+
+            let route = {
+                let mut s = state.borrow_mut();
+                s.desktop_notification_routes.remove(&notification_id)
+            };
+            let Some(route) = route else {
+                return;
+            };
+
+            activate_desktop_notification_target(
+                &state,
+                &route.target,
+                route.activation_token.as_deref(),
+            );
+        },
+    ))
+}
+
+fn connect_desktop_notification_closed_watch(
+    proxy: &gio::DBusProxy,
+    state: State,
+) -> Option<gio::SignalSubscription> {
+    let connection = proxy.connection();
+    Some(connection.subscribe_to_signal(
+        Some(FREEDESKTOP_NOTIFICATIONS_SERVICE),
+        Some(FREEDESKTOP_NOTIFICATIONS_INTERFACE),
+        Some("NotificationClosed"),
+        Some(FREEDESKTOP_NOTIFICATIONS_PATH),
+        None,
+        gio::DBusSignalFlags::NONE,
+        move |signal| {
+            let Some(notification_id) =
+                desktop_notification_closed_id_from_signal(signal.parameters)
+            else {
+                return;
+            };
+
+            state
+                .borrow_mut()
+                .desktop_notification_routes
+                .remove(&notification_id);
+        },
+    ))
+}
+
+fn activate_desktop_notification_target(
+    state: &State,
+    target: &DesktopNotificationTarget,
+    activation_token: Option<&str>,
+) {
+    let (workspace_idx, row, sidebar_list, window, workspace_changed) = {
+        let s = state.borrow();
+        let Some((idx, workspace)) = s
+            .workspaces
+            .iter()
+            .enumerate()
+            .find(|(_, workspace)| workspace.id == target.workspace_id)
+        else {
+            return;
+        };
+
+        (
+            idx,
+            workspace.sidebar_row.clone(),
+            s.sidebar_list.clone(),
+            s.window.clone(),
+            idx != s.active_idx,
+        )
+    };
+
+    if let Some(token) = activation_token.filter(|token| !token.is_empty()) {
+        window.set_startup_id(token);
+    }
+    window.present();
+    switch_workspace(state, workspace_idx);
+    sidebar_list.select_row(Some(&row));
+
+    let state_for_focus = state.clone();
+    let target_for_focus = target.clone();
+    if workspace_changed {
+        glib::idle_add_local_once(move || {
+            glib::idle_add_local_once(move || {
+                focus_desktop_notification_target(&state_for_focus, &target_for_focus);
+            });
+        });
+    } else {
+        glib::idle_add_local_once(move || {
+            focus_desktop_notification_target(&state_for_focus, &target_for_focus);
+        });
+    }
+}
+
+fn focus_desktop_notification_target(state: &State, target: &DesktopNotificationTarget) -> bool {
+    if let Some(pane_id) = target.pane_id {
+        if let Some(pane_widget) = pane::find_pane_widget_by_id(pane_id) {
+            if let Some(tab_id) = target.tab_id.as_deref() {
+                if pane::activate_tab_in_pane(&pane_widget, tab_id) {
+                    return true;
+                }
+            }
+
+            if pane::focus_active_tab_in_pane(&pane_widget) {
+                return true;
+            }
+        }
+    }
+
+    let root = {
+        let s = state.borrow();
+        s.workspaces
+            .iter()
+            .find(|workspace| workspace.id == target.workspace_id)
+            .map(|workspace| workspace.root.clone())
+    };
+
+    if let Some(root) = root {
+        focus_workspace_entrypoint(&root);
+        return true;
+    }
+
+    false
 }
 
 fn connect_gnome_appearance_watch(
@@ -3146,17 +3404,35 @@ pub(crate) fn create_pane_for_workspace(
             let state = state_for_bell.clone();
             let ws_id = ws_id_bell.clone();
             glib::idle_add_local_once(move || {
-                mark_workspace_unread(&state, &ws_id);
+                if let Some(request) = mark_workspace_unread(&state, &ws_id) {
+                    show_desktop_notification(&state, request);
+                }
             });
         }),
-        on_desktop_notification: Box::new(move |title: &str, body: &str| {
-            let state = state_for_desktop_notification.clone();
-            let ws_id = ws_id_desktop_notification.clone();
-            let message = workspace_notification_message(title, body);
-            glib::idle_add_local_once(move || {
-                mark_workspace_unread_with_message(&state, &ws_id, &message);
-            });
-        }),
+        on_desktop_notification: Box::new(
+            move |title: &str, body: &str, source_focused: bool, pane_id: u32, tab_id: &str| {
+                let state = state_for_desktop_notification.clone();
+                let ws_id = ws_id_desktop_notification.clone();
+                let tab_id = tab_id.to_string();
+                let target = DesktopNotificationTarget {
+                    workspace_id: ws_id.clone(),
+                    pane_id: Some(pane_id),
+                    tab_id: Some(tab_id),
+                };
+                let message = workspace_notification_message(title, body);
+                glib::idle_add_local_once(move || {
+                    if let Some(request) = mark_workspace_unread_with_message(
+                        &state,
+                        &ws_id,
+                        &message,
+                        source_focused,
+                        target,
+                    ) {
+                        show_desktop_notification(&state, request);
+                    }
+                });
+            },
+        ),
         on_open_browser_here: Box::new(move |pane_widget| {
             pane::add_browser_tab_to_pane(pane_widget);
         }),
@@ -4193,8 +4469,27 @@ fn find_leaf_pane(widget: &gtk::Widget, axis: gtk::Orientation, prefer_start: bo
     }
 }
 
-fn mark_workspace_unread(state: &State, ws_id: &str) {
-    mark_workspace_unread_with_message(state, ws_id, "Process needs attention");
+fn should_emit_desktop_notification(
+    desktop_notifications_enabled: bool,
+    window_active: bool,
+    workspace_is_active: bool,
+    source_focused: bool,
+) -> bool {
+    desktop_notifications_enabled && (!window_active || !workspace_is_active || !source_focused)
+}
+
+fn mark_workspace_unread(state: &State, ws_id: &str) -> Option<DesktopNotificationRequest> {
+    mark_workspace_unread_with_message(
+        state,
+        ws_id,
+        "Process needs attention",
+        true,
+        DesktopNotificationTarget {
+            workspace_id: ws_id.to_string(),
+            pane_id: None,
+            tab_id: None,
+        },
+    )
 }
 
 fn workspace_notification_message(title: &str, body: &str) -> String {
@@ -4208,15 +4503,37 @@ fn workspace_notification_message(title: &str, body: &str) -> String {
     }
 }
 
-fn mark_workspace_unread_with_message(state: &State, ws_id: &str, message: &str) {
+fn mark_workspace_unread_with_message(
+    state: &State,
+    ws_id: &str,
+    message: &str,
+    source_focused: bool,
+    target: DesktopNotificationTarget,
+) -> Option<DesktopNotificationRequest> {
     let mut s = state.borrow_mut();
     let active_idx = s.active_idx;
+    let window_active = s.window.is_active();
+    let notifications = s.config.borrow().notifications;
     if let Some((idx, ws)) = s
         .workspaces
         .iter_mut()
         .enumerate()
         .find(|(_, w)| w.id == ws_id)
     {
+        let workspace_is_active = idx == active_idx;
+        let desktop_request = should_emit_desktop_notification(
+            notifications.enabled,
+            window_active,
+            workspace_is_active,
+            source_focused,
+        )
+        .then(|| DesktopNotificationRequest {
+            summary: ws.name.clone(),
+            body: message.to_string(),
+            sound: notifications.sound,
+            target: target.clone(),
+        });
+
         if idx != active_idx {
             ws.unread = true;
             ws.notify_dot.remove_css_class("limux-notify-dot-hidden");
@@ -4230,7 +4547,93 @@ fn mark_workspace_unread_with_message(state: &State, ws_id: &str, message: &str)
                 row_box.add_css_class("limux-sidebar-row-unread");
             }
         }
+
+        return desktop_request;
     }
+
+    None
+}
+
+fn desktop_notification_hints(
+    sound: app_config::NotificationSound,
+) -> HashMap<String, glib::Variant> {
+    let mut hints = HashMap::from([("desktop-entry".to_string(), crate::APP_ID.to_variant())]);
+
+    match sound {
+        app_config::NotificationSound::Default => {}
+        app_config::NotificationSound::None => {
+            hints.insert("suppress-sound".to_string(), true.to_variant());
+        }
+        _ => {
+            if let Some(sound_name) = sound.freedesktop_sound_name() {
+                let sound_variant = sound_name.to_variant();
+                hints.insert("sound-name".to_string(), sound_variant.clone());
+                hints.insert("x-canonical-sound-name".to_string(), sound_variant);
+            }
+        }
+    }
+
+    hints
+}
+
+fn desktop_notification_actions() -> Vec<String> {
+    vec!["default".to_string(), "Open".to_string()]
+}
+
+fn show_desktop_notification(state: &State, request: DesktopNotificationRequest) {
+    let state = state.clone();
+    gio::DBusProxy::for_bus(
+        gio::BusType::Session,
+        gio::DBusProxyFlags::NONE,
+        None::<&gio::DBusInterfaceInfo>,
+        FREEDESKTOP_NOTIFICATIONS_SERVICE,
+        FREEDESKTOP_NOTIFICATIONS_PATH,
+        FREEDESKTOP_NOTIFICATIONS_INTERFACE,
+        None::<&gio::Cancellable>,
+        move |result| {
+            let Ok(proxy) = result else {
+                return;
+            };
+            let route = DesktopNotificationRoute {
+                target: request.target.clone(),
+                activation_token: None,
+            };
+
+            let params = (
+                "Limux",
+                0u32,
+                crate::APP_ID,
+                request.summary.as_str(),
+                request.body.as_str(),
+                desktop_notification_actions(),
+                desktop_notification_hints(request.sound),
+                DESKTOP_NOTIFICATION_EXPIRE_TIMEOUT_MS,
+            )
+                .to_variant();
+
+            proxy.call(
+                "Notify",
+                Some(&params),
+                gio::DBusCallFlags::NONE,
+                DESKTOP_NOTIFICATION_DBUS_TIMEOUT_MS,
+                None::<&gio::Cancellable>,
+                move |result| {
+                    let Ok(response) = result else {
+                        return;
+                    };
+                    let Some(notification_id) = desktop_notification_id_from_response(&response)
+                    else {
+                        return;
+                    };
+
+                    state
+                        .borrow_mut()
+                        .desktop_notification_routes
+                        .insert(notification_id, route.clone());
+                },
+            );
+        },
+    );
 }
 
 #[cfg(test)]
@@ -4241,15 +4644,20 @@ mod tests {
     use super::glib;
     use super::gtk::ffi;
     use super::gtk::gdk;
+    use super::ToVariant;
     use super::{
-        build_window_css, clamp_workspace_insert_index_for_pinning, directional_neighbor_score,
-        favorites_prefix_len, font_size_after_delta, ghostty_prefers_dark,
-        gtk_system_prefers_dark_from_raw, next_active_workspace_index, queue_session_save_request,
-        resolved_system_prefers_dark, sanitize_background_opacity,
+        build_window_css, clamp_workspace_insert_index_for_pinning,
+        desktop_notification_action_from_signal, desktop_notification_actions,
+        desktop_notification_activation_token_from_signal,
+        desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
+        directional_neighbor_score, favorites_prefix_len, font_size_after_delta,
+        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, next_active_workspace_index,
+        queue_session_save_request, resolved_system_prefers_dark, sanitize_background_opacity,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
-        shortcut_command_from_key_event, shortcut_dispatch_propagation, tab_drag_workspace_seed,
-        use_opaque_window_background, workspace_drop_layout_path, workspace_notification_message,
-        Direction, EditableCaptureContext, NeighborScore, PaneBounds, PortalColorSchemePreference,
+        shortcut_command_from_key_event, shortcut_dispatch_propagation,
+        should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
+        workspace_drop_layout_path, workspace_notification_message, Direction,
+        EditableCaptureContext, NeighborScore, PaneBounds, PortalColorSchemePreference,
         SessionSaveAccess, SessionSaveRequest, WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
@@ -4417,6 +4825,36 @@ mod tests {
     }
 
     #[test]
+    fn desktop_notification_actions_include_default_open_action() {
+        assert_eq!(
+            desktop_notification_actions(),
+            vec!["default".to_string(), "Open".to_string()]
+        );
+    }
+
+    #[test]
+    fn desktop_notification_response_and_signal_parsers_match_dbus_shapes() {
+        assert_eq!(
+            desktop_notification_id_from_response(&(42u32,).to_variant()),
+            Some(42)
+        );
+        assert_eq!(
+            desktop_notification_action_from_signal(&(42u32, "default".to_string()).to_variant()),
+            Some((42, "default".to_string()))
+        );
+        assert_eq!(
+            desktop_notification_activation_token_from_signal(
+                &(42u32, "token-123".to_string()).to_variant()
+            ),
+            Some((42, "token-123".to_string()))
+        );
+        assert_eq!(
+            desktop_notification_closed_id_from_signal(&(42u32, 2u32).to_variant()),
+            Some(42)
+        );
+    }
+
+    #[test]
     fn queue_session_save_request_sets_queued_once() {
         let state = Rc::new(RefCell::new(TestSessionSaveState::default()));
 
@@ -4564,6 +5002,17 @@ mod tests {
             workspace_notification_message("  ", "  "),
             "Process needs attention"
         );
+    }
+
+    #[test]
+    fn desktop_notifications_only_fire_for_background_workspaces() {
+        assert!(should_emit_desktop_notification(true, false, false, false));
+        assert!(should_emit_desktop_notification(true, true, false, false));
+        assert!(should_emit_desktop_notification(true, true, true, false));
+        assert!(!should_emit_desktop_notification(
+            false, false, false, false
+        ));
+        assert!(!should_emit_desktop_notification(true, true, true, true));
     }
 
     #[test]
