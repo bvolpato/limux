@@ -1660,18 +1660,13 @@ pub fn build_window(app: &adw::Application) {
         click_anywhere.connect_pressed(move |_, _, x, y| {
             let entry = find_active_rename_entry(&sl).or_else(|| pane::find_tab_rename_entry(&win));
             if let Some(entry) = entry {
-                // Translate click coords from window to the entry's coordinate space
-                if let Some((ex, ey)) = win.translate_coordinates(&entry, x, y) {
-                    let alloc = entry.allocation();
-                    if ex >= 0.0
-                        && ey >= 0.0
-                        && ex <= alloc.width() as f64
-                        && ey <= alloc.height() as f64
-                    {
-                        return; // click is inside the entry
-                    }
-                }
-                entry.emit_activate();
+                let allocation = entry.allocation();
+                commit_inline_rename_for_click(
+                    win.translate_coordinates(&entry, x, y),
+                    allocation.width(),
+                    allocation.height(),
+                    || entry.emit_activate(),
+                );
             }
         });
         window.add_controller(click_anywhere);
@@ -3162,6 +3157,20 @@ fn find_active_rename_entry(sidebar_list: &gtk::ListBox) -> Option<gtk::Entry> {
         row = r.next_sibling();
     }
     None
+}
+
+fn commit_inline_rename_for_click(
+    translated_click: Option<(f64, f64)>,
+    entry_width: i32,
+    entry_height: i32,
+    commit: impl FnOnce(),
+) {
+    let click_is_inside = translated_click.is_some_and(|(x, y)| {
+        x >= 0.0 && y >= 0.0 && x <= entry_width as f64 && y <= entry_height as f64
+    });
+    if !click_is_inside {
+        commit();
+    }
 }
 
 fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
@@ -6173,7 +6182,7 @@ fn show_desktop_notification(state: &State, request: DesktopNotificationRequest)
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use super::glib;
@@ -6182,8 +6191,9 @@ mod tests {
     use super::ToVariant;
     use super::{
         browser_command_requires_existing_target, build_window_css,
-        clamp_workspace_insert_index_for_pinning, desktop_notification_action_from_signal,
-        desktop_notification_actions, desktop_notification_activation_token_from_signal,
+        clamp_workspace_insert_index_for_pinning, commit_inline_rename_for_click,
+        desktop_notification_action_from_signal, desktop_notification_actions,
+        desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
         directional_neighbor_score, favorites_prefix_len, find_leaf_pane, font_size_after_delta,
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, has_unread,
@@ -6480,6 +6490,21 @@ mod tests {
             [HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS]
         );
         assert!(BASE_CSS.contains(".limux-ws-rename-entry"));
+    }
+
+    #[test]
+    fn outside_rename_click_commits_while_inside_click_preserves_editor() {
+        for (click, should_commit) in [
+            (Some((0.0, 0.0)), false),
+            (Some((120.0, 32.0)), false),
+            (Some((-0.1, 16.0)), true),
+            (Some((60.0, 32.1)), true),
+            (None, true),
+        ] {
+            let entry_present = Cell::new(true);
+            commit_inline_rename_for_click(click, 120, 32, || entry_present.set(false));
+            assert_eq!(entry_present.get(), !should_commit, "click: {click:?}");
+        }
     }
 
     #[test]
