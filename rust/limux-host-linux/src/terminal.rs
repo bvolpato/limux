@@ -1349,6 +1349,33 @@ pub(crate) fn default_font_size() -> f32 {
     *SIZE.get_or_init(crate::ghostty_config::read_font_size)
 }
 
+fn free_terminal_surface(
+    surface: ghostty_surface_t,
+    clipboard_context_cell: &Cell<*mut ClipboardContext>,
+) {
+    let surface_key = surface as usize;
+    let entry = SURFACE_MAP.with(|map| map.borrow_mut().remove(&surface_key));
+    let clipboard_context = entry
+        .as_ref()
+        .map(|entry| entry.clipboard_context)
+        .unwrap_or_else(|| clipboard_context_cell.get());
+
+    clipboard_context_cell.set(ptr::null_mut());
+    if let Some(entry) = entry.as_ref() {
+        unregister_surface_identity(entry.identity);
+    }
+
+    // Ghostty can invoke callbacks while its worker threads stop. Keep callback
+    // userdata and widgets alive until deinitialization finishes.
+    unsafe { ghostty_surface_free(surface) };
+    if !clipboard_context.is_null() {
+        unsafe {
+            drop(Box::from_raw(clipboard_context));
+        }
+    }
+    drop(entry);
+}
+
 /// Create a new Ghostty-powered terminal widget.
 /// Returns an Overlay (GLArea + toast layer) for embedding in the pane.
 pub fn create_terminal(
@@ -2019,26 +2046,18 @@ pub fn create_terminal(
         });
     }
 
-    // Clean up only when the widget is actually destroyed.
+    // SurfaceEntry retains overlay and its children, so cleanup must follow the
+    // terminal root, which the surface registry does not own.
     {
         let surface_cell = surface_cell.clone();
         let clipboard_context_cell = clipboard_context_cell.clone();
         let im_context = im_context.clone();
         let im_fallback = im_fallback.clone();
-        overlay.connect_destroy(move |_| {
+        root.connect_destroy(move |_| {
             im_context.set_client_widget(gtk::Widget::NONE);
             im_fallback.set_client_widget(gtk::Widget::NONE);
             if let Some(surface) = surface_cell.borrow_mut().take() {
-                let surface_key = surface as usize;
-                SURFACE_MAP.with(|map| {
-                    if let Some(entry) = map.borrow_mut().remove(&surface_key) {
-                        unregister_surface_identity(entry.identity);
-                        unsafe {
-                            drop(Box::from_raw(entry.clipboard_context));
-                        }
-                    }
-                });
-                unsafe { ghostty_surface_free(surface) };
+                free_terminal_surface(surface, &clipboard_context_cell);
             } else {
                 let clipboard_context = clipboard_context_cell.replace(ptr::null_mut());
                 if !clipboard_context.is_null() {
