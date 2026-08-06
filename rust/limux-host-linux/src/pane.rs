@@ -2476,7 +2476,9 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
     menu.popup();
 }
 
-fn find_tab_rename_entry<W: glib::object::IsA<gtk::Widget>>(root: &W) -> Option<gtk::Entry> {
+pub(crate) fn find_tab_rename_entry<W: glib::object::IsA<gtk::Widget>>(
+    root: &W,
+) -> Option<gtk::Entry> {
     fn find_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
         if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
             if entry.has_css_class(TAB_RENAME_ENTRY_CSS_CLASS) {

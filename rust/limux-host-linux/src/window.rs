@@ -1650,15 +1650,16 @@ pub fn build_window(app: &adw::Application) {
     register_window_actions(&window, &state);
     install_key_capture(&window, &state);
 
-    // Any click anywhere in the window commits an active sidebar rename,
-    // UNLESS the click is inside the rename Entry itself.
+    // Any click anywhere in the window commits an active inline rename,
+    // unless the click is inside the rename entry itself.
     {
         let sl = sidebar_list.clone();
         let win = window.clone();
         let click_anywhere = gtk::GestureClick::new();
         click_anywhere.set_propagation_phase(gtk::PropagationPhase::Capture);
         click_anywhere.connect_pressed(move |_, _, x, y| {
-            if let Some(entry) = find_active_rename_entry(&sl) {
+            let entry = find_active_rename_entry(&sl).or_else(|| pane::find_tab_rename_entry(&win));
+            if let Some(entry) = entry {
                 // Translate click coords from window to the entry's coordinate space
                 if let Some((ex, ey)) = win.translate_coordinates(&entry, x, y) {
                     let alloc = entry.allocation();
@@ -1670,7 +1671,7 @@ pub fn build_window(app: &adw::Application) {
                         return; // click is inside the entry
                     }
                 }
-                commit_any_active_rename(&sl);
+                entry.emit_activate();
             }
         });
         window.add_controller(click_anywhere);
@@ -3161,32 +3162,6 @@ fn find_active_rename_entry(sidebar_list: &gtk::ListBox) -> Option<gtk::Entry> {
         row = r.next_sibling();
     }
     None
-}
-
-/// Find any active rename Entry in the sidebar and trigger its activate signal to commit.
-fn commit_any_active_rename(sidebar_list: &gtk::ListBox) {
-    let mut row = sidebar_list.first_child();
-    while let Some(r) = row {
-        // Walk into the row's children to find a gtk::Entry
-        fn find_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
-            if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
-                return Some(entry.clone());
-            }
-            let mut child = widget.first_child();
-            while let Some(c) = child {
-                if let Some(entry) = find_entry(&c) {
-                    return Some(entry);
-                }
-                child = c.next_sibling();
-            }
-            None
-        }
-        if let Some(entry) = find_entry(&r) {
-            entry.emit_activate();
-            return;
-        }
-        row = r.next_sibling();
-    }
 }
 
 fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
