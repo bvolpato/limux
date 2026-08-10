@@ -1,37 +1,29 @@
-use std::{env, path::PathBuf};
+use std::path::PathBuf;
 
 fn main() {
     // Find libghostty relative to the workspace root.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let ghostty_root = manifest_dir.join("../../ghostty");
+    let ghostty_library = "libghostty-internal.so";
     let ghostty_lib = ghostty_root
         .join("zig-out/lib")
         .canonicalize()
-        .expect("libghostty not found — run: cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast");
+        .expect("Ghostty library directory not found — run: cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast");
 
-    println!("cargo:rustc-link-search=native={}", ghostty_lib.display());
-    println!("cargo:rustc-link-lib=dylib=ghostty");
-    println!("cargo:rustc-link-lib=dylib=epoxy");
-
-    // Compile glad (GL loader) which libghostty depends on but doesn't
-    // include when built as a shared library.
-    let glad_src = ghostty_root.join("vendor/glad/src/gl.c");
-    let glad_include = ghostty_root.join("vendor/glad/include");
-    if glad_src.exists() {
-        cc::Build::new()
-            .file(&glad_src)
-            .include(&glad_include)
-            .cargo_metadata(false)
-            .compile("glad");
-
-        let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
-        println!("cargo:rustc-link-search=native={}", out_dir.display());
-        println!("cargo:rustc-link-lib=static:+whole-archive=glad");
+    if !ghostty_lib.join(ghostty_library).is_file() {
+        panic!(
+            "{ghostty_library} not found at {} — run: cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast",
+            ghostty_lib.display()
+        );
     }
 
-    // Re-run if libghostty changes
+    println!("cargo:rustc-link-search=native={}", ghostty_lib.display());
+    println!("cargo:rustc-link-lib=dylib=ghostty-internal");
+    println!("cargo:rustc-link-lib=dylib=epoxy");
+
+    // Re-run if libghostty changes.
     println!(
         "cargo:rerun-if-changed={}",
-        ghostty_lib.join("libghostty.so").display()
+        ghostty_lib.join(ghostty_library).display()
     );
 }

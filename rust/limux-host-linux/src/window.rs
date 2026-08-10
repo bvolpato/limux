@@ -1337,14 +1337,44 @@ row:selected .limux-ws-path {
 
 const CONTENT_BACKGROUND_RGB: (u8, u8, u8) = (23, 23, 23);
 
+/// Squares off the CSD window corners and drops the client-side shadow
+/// when the compositor draws the window decorations (see
+/// `compositor_provides_decorations`), so the window fills the KWin frame
+/// without transparent gaps at the corners.
+const SSD_CSS: &str = r#"
+window.csd,
+window.csd:backdrop {
+    --window-radius: 0px;
+    border-radius: 0;
+    box-shadow: none;
+    outline: none;
+}
+"#;
+
+/// True when the compositor speaks the KDE server-decoration protocol
+/// (KWin). In that case build_window() requests server-side decorations
+/// from the compositor and skips the in-app header bar.
+fn compositor_provides_decorations() -> bool {
+    gtk::gdk::Display::default()
+        .and_then(|display| display.downcast::<gdk4_wayland::WaylandDisplay>().ok())
+        .map(|display| display.query_registry("org_kde_kwin_server_decoration_manager"))
+        .unwrap_or(false)
+}
+
 fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
+    let ssd_css = if compositor_provides_decorations() {
+        SSD_CSS
+    } else {
+        ""
+    };
     format!(
-        "{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}",
         build_window_css(background_opacity),
         pane::PANE_CSS,
         keybind_editor::KEYBIND_EDITOR_CSS,
         crate::settings_editor::SETTINGS_CSS,
         crate::settings_editor::ui_scale_css(config),
+        ssd_css,
     )
 }
 
@@ -1432,17 +1462,16 @@ pub fn build_window(app: &adw::Application) {
         .build();
     apply_window_background_class(&window, background_opacity);
 
-    // On Wayland compositors with xdg-decoration support, the compositor
-    // already provides the window chrome, so keep Limux from rendering a
-    // duplicate header bar. X11 continues to use the in-app header.
-    let provides_decorations = display
-        .clone()
-        .downcast::<gdk4_wayland::WaylandDisplay>()
-        .ok()
-        .map(|display| display.query_registry("zxdg_decoration_manager_v1"))
-        .unwrap_or(false);
+    // libadwaita forces client-side decorations (it installs an invisible
+    // titlebar widget internally), so compositors never draw server-side
+    // decorations for Limux on their own. When the compositor speaks the
+    // KDE server-decoration protocol (KWin), skip the in-app header bar:
+    // build_window() explicitly requests SERVER mode after present(),
+    // which makes the compositor draw the window chrome. Everywhere else
+    // (mutter, X11, …) the in-app header bar is the only chrome we get.
+    let compositor_provides_decorations = compositor_provides_decorations();
 
-    let header = if provides_decorations {
+    let header = if compositor_provides_decorations {
         None
     } else {
         let bar = adw::HeaderBar::new();
@@ -1726,6 +1755,15 @@ pub fn build_window(app: &adw::Application) {
         window.connect_close_request(move |_| {
             save_session_now(&state);
             stop_session_saves_for_shutdown(&state);
+            let split_containers: Vec<_> = state
+                .borrow()
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.split_container.clone())
+                .collect();
+            for split_container in split_containers {
+                split_container.retire_panes();
+            }
             CONTROL_STATE.with(|slot| {
                 slot.borrow_mut().take();
             });
@@ -1738,6 +1776,20 @@ pub fn build_window(app: &adw::Application) {
     crate::control_bridge::start(dispatch_control_command);
 
     window.present();
+
+    // Ask the compositor for server-side decorations when it supports the
+    // KDE server-decoration protocol (see the header-bar decision above).
+    // libadwaita marks the window client-decorated, which makes GtkWindow
+    // compute decorated=false at realize time; forcing the GDK-level
+    // property after present() makes GDK request SERVER mode from KWin via
+    // org_kde_kwin_server_decoration.
+    if compositor_provides_decorations {
+        if let Some(surface) = window.surface() {
+            if let Ok(toplevel) = surface.downcast::<gtk::gdk::Toplevel>() {
+                toplevel.set_decorated(true);
+            }
+        }
+    }
 }
 
 fn build_window_css(background_opacity: f64) -> String {
@@ -4881,8 +4933,20 @@ fn close_workspace_by_id_internal(
     persist: bool,
     preferred_active_workspace_id: Option<&str>,
 ) {
+    let split_container = {
+        let s = state.borrow();
+        s.workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
+            .map(|workspace| workspace.split_container.clone())
+    };
+    let Some(split_container) = split_container else {
+        return;
+    };
+    split_container.retire_panes();
+
     let mut s = state.borrow_mut();
-    let Some(idx) = s.workspaces.iter().position(|w| w.id == id) else {
+    let Some(idx) = s.workspaces.iter().position(|workspace| workspace.id == id) else {
         return;
     };
     let desired_active_workspace_id = preferred_active_workspace_id
@@ -5371,8 +5435,8 @@ fn show_runtime_error(state: &State, title: &str, detail: &str) {
 }
 
 fn quit_app(state: &State) {
-    save_session_now(state);
-    state.borrow().app.quit();
+    let window = state.borrow().window.clone();
+    window.close();
 }
 
 fn spawn_new_instance(state: &State) -> bool {

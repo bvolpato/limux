@@ -49,12 +49,16 @@ cd limux-*-linux-x86_64
 sudo ./install.sh
 ```
 
-**Arch Linux (unofficial AUR package)** — community-maintained by [antonbarchukov](https://github.com/antonbarchukov):
+**Arch Linux (AUR):**
 ```bash
+# Prebuilt release package
 yay -S limux-bin
+
+# Build Limux and Ghostty from source
+yay -S limux
 ```
 
-The AUR package is available at [`limux-bin`](https://aur.archlinux.org/packages/limux-bin). Thanks to [antonbarchukov](https://github.com/antonbarchukov) for packaging Limux for Arch users. Arch packaging is not currently maintained by upstream; please report AUR packaging issues to the package maintainer first. See [issue #5](https://github.com/am-will/limux/issues/5).
+Both [`limux-bin`](https://aur.archlinux.org/packages/limux-bin) and the source-built [`limux`](https://aur.archlinux.org/packages/limux) package are published from this repository. Thanks to [Anton Barchukov](https://github.com/antonbarchukov) for creating the original Arch packaging in [PR #50](https://github.com/am-will/limux/pull/50).
 
 To uninstall:
 ```bash
@@ -77,7 +81,7 @@ sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4
 ### Prerequisites
 
 - Rust toolchain (stable)
-- Zig
+- Zig 0.16.0
 - GTK4, libadwaita, WebKitGTK dev packages
 - Initialized Ghostty submodule
 
@@ -92,7 +96,7 @@ git submodule update --init --recursive
 # Build limux
 cargo build --release
 
-# Run (point to libghostty.so location)
+# Run (point to libghostty-internal.so location)
 LD_LIBRARY_PATH=../ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
 ```
 
@@ -102,8 +106,8 @@ LD_LIBRARY_PATH=../ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
 ./scripts/package.sh
 ```
 
-This builds the binary, bundles `libghostty.so`, icons, and an install script into a tarball.
-`package.sh` also rebuilds `libghostty.so` with `ReleaseFast` and `-Dcpu=baseline`, so Zig and the initialized Ghostty submodule must be present.
+This builds the binary, bundles `libghostty-internal.so`, icons, and an install script into a tarball.
+`package.sh` also rebuilds `libghostty-internal.so` with `ReleaseFast` and `-Dcpu=baseline`, so Zig 0.16.0 and initialized Ghostty submodule must be present.
 
 ## Development
 
@@ -247,7 +251,7 @@ rust/
   limux-cli/           # CLI client
 ```
 
-The terminal rendering is handled entirely by Ghostty's embedded library (`libghostty.so`), which provides GPU-accelerated OpenGL rendering. The UI layer is native GTK4 with libadwaita.
+The terminal rendering is handled entirely by Ghostty's embedded library (`libghostty-internal.so`), which provides GPU-accelerated OpenGL rendering. The UI layer is native GTK4 with libadwaita.
 
 ## License
 

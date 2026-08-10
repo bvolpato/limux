@@ -181,7 +181,15 @@ pub fn retire_pane(pane_widget: &gtk::Widget) {
     };
     let internals = unsafe { outer.steal_data::<Rc<PaneInternals>>("limux-pane-internals") };
     if let Some(internals) = internals {
-        for entry in &internals.tab_state.borrow().tabs {
+        let entries = {
+            let mut tab_state = internals.tab_state.borrow_mut();
+            tab_state.active_tab = None;
+            tab_state.active_rename_tab = None;
+            std::mem::take(&mut tab_state.tabs)
+        };
+        for entry in entries {
+            internals.tab_strip.remove(&entry.tab_button);
+            internals.content_stack.remove(&entry.content);
             entry.prepare_for_removal();
         }
         unregister_pane(internals.pane_id);
@@ -965,8 +973,10 @@ struct TabEntry {
 
 impl TabEntry {
     fn prepare_for_removal(&self) {
-        if let TabKind::Browser { state } = &self.kind {
-            state.handles.prepare_for_removal();
+        match &self.kind {
+            TabKind::Terminal { state } => state.handle.shutdown(),
+            TabKind::Browser { state } => state.handles.prepare_for_removal(),
+            TabKind::Keybinds => {}
         }
     }
 }
@@ -3255,9 +3265,9 @@ fn remove_tab(
         )
     };
 
-    entry.prepare_for_removal();
     tab_strip.remove(&entry.tab_button);
     content_stack.remove(&entry.content);
+    entry.prepare_for_removal();
 
     let Some(new_id) = new_id else {
         if removed_was_unread {
