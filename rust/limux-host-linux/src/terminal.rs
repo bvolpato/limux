@@ -11,7 +11,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use limux_ghostty_sys::*;
@@ -21,6 +21,7 @@ use crate::link_uri;
 use crate::shortcut_config::NormalizedShortcut;
 
 mod clipboard;
+mod wakeup;
 use clipboard::{
     ghostty_confirm_read_clipboard_cb, ghostty_read_clipboard_cb, ghostty_write_clipboard_cb,
 };
@@ -42,7 +43,7 @@ static GHOSTTY: OnceLock<GhosttyState> = OnceLock::new();
 static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIGHT);
 static CURRENT_SCROLLBAR_ENABLED: AtomicBool = AtomicBool::new(true);
 static CURRENT_COMMAND_ACCEPTS_SHELL_INPUT: AtomicBool = AtomicBool::new(true);
-static WAKEUP_IDLE_QUEUED: AtomicBool = AtomicBool::new(false);
+static GHOSTTY_WAKEUP: LazyLock<wakeup::Wakeup> = LazyLock::new(wakeup::Wakeup::default);
 static EMPTY_CLIPBOARD_TEXT: [u8; 1] = [0];
 
 type TitleChangedCallback = dyn Fn(&str);
@@ -741,16 +742,6 @@ pub fn init_ghostty() {
 
         let app = unsafe { ghostty_app_new(&runtime_config, config) };
 
-        // Ghostty's GTK apprt calls core_app.tick() on every GLib main
-        // loop iteration to drain the app mailbox (which includes
-        // redraw_surface messages from the renderer thread). The renderer
-        // thread pushes these messages but doesn't wake the app.
-        // We replicate this with a high-frequency timer (~8ms ≈ 120Hz).
-        glib::timeout_add_local(std::time::Duration::from_millis(8), move || {
-            unsafe { ghostty_app_tick(app) };
-            glib::ControlFlow::Continue
-        });
-
         GhosttyState {
             app,
             background_opacity,
@@ -922,25 +913,11 @@ pub fn sync_color_scheme(dark: bool) {
 // Runtime callbacks (C ABI)
 // ---------------------------------------------------------------------------
 
-fn claim_wakeup_idle_slot(flag: &AtomicBool) -> bool {
-    !flag.swap(true, Ordering::AcqRel)
-}
-
-fn release_wakeup_idle_slot(flag: &AtomicBool) {
-    flag.store(false, Ordering::Release);
-}
-
 unsafe extern "C" fn ghostty_wakeup_cb(_userdata: *mut c_void) {
-    // Collapse renderer wakeups to a single pending idle source so text floods
-    // do not enqueue unbounded GTK callbacks on the main thread.
-    if claim_wakeup_idle_slot(&WAKEUP_IDLE_QUEUED) {
-        glib::idle_add_once(|| {
-            release_wakeup_idle_slot(&WAKEUP_IDLE_QUEUED);
-            let app = ghostty_app();
-            unsafe { ghostty_app_tick(app) };
-        });
-    }
-    glib::MainContext::default().wakeup();
+    GHOSTTY_WAKEUP.queue(&glib::MainContext::default(), || {
+        let app = ghostty_app();
+        unsafe { ghostty_app_tick(app) };
+    });
 }
 
 unsafe extern "C" fn ghostty_action_cb(
@@ -3975,17 +3952,5 @@ mod tests {
     #[test]
     fn shell_escape_joined_bytes_rejects_empty_input() {
         assert!(shell_escape_joined_bytes(std::iter::empty::<&[u8]>()).is_none());
-    }
-
-    #[test]
-    fn wakeup_idle_slot_coalesces_until_released() {
-        let flag = AtomicBool::new(false);
-
-        assert!(claim_wakeup_idle_slot(&flag));
-        assert!(!claim_wakeup_idle_slot(&flag));
-
-        release_wakeup_idle_slot(&flag);
-
-        assert!(claim_wakeup_idle_slot(&flag));
     }
 }
