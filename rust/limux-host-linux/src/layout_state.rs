@@ -648,6 +648,19 @@ impl RestorableAgentIndex {
     }
 }
 
+pub(crate) fn attach_restorable_agents_to_session(
+    session: &mut AppSessionState,
+    index: &RestorableAgentIndex,
+) {
+    for workspace in &mut session.workspaces {
+        attach_restorable_agents_to_layout(
+            &mut workspace.layout,
+            workspace.id.as_deref().unwrap_or(""),
+            index,
+        );
+    }
+}
+
 pub fn attach_restorable_agents_to_layout(
     layout: &mut LayoutNodeState,
     workspace_id: &str,

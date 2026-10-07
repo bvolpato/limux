@@ -35,6 +35,177 @@ fn disk(directory: &Path) -> AppSessionState {
     read_session(directory).unwrap().state
 }
 
+#[test]
+fn background_save_keeps_the_main_context_responsive_and_preserves_merge_ancestry() {
+    use std::time::{Duration, Instant};
+    let dir = tempdir().unwrap();
+    let base = initial(dir.path());
+    let (store, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    let lock = lock_directory(dir.path()).unwrap();
+    let mut local = base.clone();
+    local.workspaces[0].name = "first local edit".into();
+    let context = gtk4::glib::MainContext::new();
+    context
+        .with_thread_default(|| {
+            context.block_on(async {
+                let start = Instant::now();
+                let task = store.save_in_background(local.clone());
+                gtk4::glib::timeout_future(Duration::from_millis(50)).await;
+                assert!(start.elapsed() < Duration::from_secs(1));
+                let mut remote = base;
+                remote.workspaces[1].name = "independent remote edit".into();
+                layout_state::save_session_atomic_in(dir.path(), &remote).unwrap();
+                drop(lock);
+                let (store, snapshot, result) = task.await.unwrap();
+                assert!(matches!(result.unwrap(), SaveOutcome::Saved));
+                assert_eq!(snapshot, local);
+
+                local.workspaces[0].name = "latest local edit".into();
+                let (_, snapshot, result) = store.save_in_background(local.clone()).await.unwrap();
+                assert!(matches!(result.unwrap(), SaveOutcome::Saved));
+                assert_eq!(snapshot, local);
+                let saved = disk(dir.path());
+                assert_eq!(saved.workspaces[0].name, "latest local edit");
+                assert_eq!(saved.workspaces[1].name, "independent remote edit");
+            });
+        })
+        .unwrap();
+}
+
+#[test]
+fn background_save_returns_conflicts_and_preserves_the_latest_recovery() {
+    let dir = tempdir().unwrap();
+    let base = initial(dir.path());
+    let (store, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    let mut remote = base.clone();
+    remote.workspaces[0].name = "remote edit".into();
+    layout_state::save_session_atomic_in(dir.path(), &remote).unwrap();
+    let mut local = base;
+    local.workspaces[0].name = "local edit".into();
+    let context = gtk4::glib::MainContext::new();
+    context
+        .with_thread_default(|| {
+            context.block_on(async {
+                let (store, _, result) = store.save_in_background(local.clone()).await.unwrap();
+                assert!(matches!(result.unwrap(), SaveOutcome::Conflict { .. }));
+                local.workspaces[0].name = "edit while confirming recovery".into();
+                let (_, _, result) = store.save_in_background(local.clone()).await.unwrap();
+                let SaveOutcome::Conflict { recovery, .. } = result.unwrap() else {
+                    panic!("stale local edits must still conflict");
+                };
+                let recovered: AppSessionState =
+                    serde_json::from_slice(&fs::read(recovery).unwrap()).unwrap();
+                assert_eq!(recovered, local);
+                assert_eq!(disk(dir.path()), remote);
+            });
+        })
+        .unwrap();
+}
+
+#[test]
+fn background_save_returns_errors_without_losing_the_store_or_unsaved_changes() {
+    let dir = tempdir().unwrap();
+    let base = initial(dir.path());
+    let (store, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+    let mut local = base.clone();
+    local.workspaces[0].name = "unsaved edit".into();
+    let path = layout_state::canonical_session_path_in(dir.path());
+    fs::write(&path, "invalid session").unwrap();
+    let context = gtk4::glib::MainContext::new();
+    context
+        .with_thread_default(|| {
+            context.block_on(async {
+                let (store, snapshot, result) =
+                    store.save_in_background(local.clone()).await.unwrap();
+                assert!(result.is_err());
+                assert_eq!(snapshot, local);
+                assert_eq!(fs::read_to_string(&path).unwrap(), "invalid session");
+                layout_state::save_session_atomic_in(dir.path(), &base).unwrap();
+                let (_, _, result) = store.save_in_background(local.clone()).await.unwrap();
+                assert!(matches!(result.unwrap(), SaveOutcome::Saved));
+                assert_eq!(disk(dir.path()), local);
+            });
+        })
+        .unwrap();
+}
+
+#[test]
+#[ignore = "manual before/after session-save contention measurement; no display required"]
+fn measure_session_save_lock_contention() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+    for background in [false, true] {
+        for trial in 1..=3 {
+            let dir = tempdir().unwrap();
+            let state = AppSessionState {
+                workspaces: (1..=20)
+                    .map(|id| {
+                        let mut workspace = workspace(id);
+                        let LayoutNodeState::Pane(pane) = &mut workspace.layout else {
+                            unreachable!();
+                        };
+                        for tab in 1..if id <= 15 { 3 } else { 2 } {
+                            pane.tabs
+                                .push(TabState::terminal(format!("tab-{id}-{tab}"), Some("/tmp")));
+                        }
+                        workspace
+                    })
+                    .collect(),
+                ..AppSessionState::default()
+            };
+            layout_state::save_session_atomic_in(dir.path(), &state).unwrap();
+            let (mut store, _) = SessionStore::load_from_dir(dir.path()).unwrap();
+            let lock = lock_directory(dir.path()).unwrap();
+            let context = gtk4::glib::MainContext::new();
+            context
+                .with_thread_default(|| {
+                    let max_gap = Rc::new(Cell::new(Duration::ZERO));
+                    let ticks = Rc::new(Cell::new(0));
+                    let tick_max = max_gap.clone();
+                    let tick_count = ticks.clone();
+                    let heartbeat = context.spawn_local(async move {
+                        let mut last = Instant::now();
+                        loop {
+                            gtk4::glib::timeout_future(Duration::from_millis(10)).await;
+                            let now = Instant::now();
+                            tick_max.set(tick_max.get().max(now.duration_since(last)));
+                            tick_count.set(tick_count.get() + 1);
+                            last = now;
+                        }
+                    });
+                    context.block_on(async {
+                        gtk4::glib::timeout_future(Duration::from_millis(30)).await;
+                        let owner = std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(1200));
+                            drop(lock);
+                        });
+                        let start = Instant::now();
+                        if background {
+                            let (_, _, result) =
+                                store.save_in_background(state.clone()).await.unwrap();
+                            assert!(matches!(result.unwrap(), SaveOutcome::Saved));
+                        } else {
+                            saved(&mut store, &state);
+                        }
+                        let save_elapsed = start.elapsed();
+                        gtk4::glib::timeout_future(Duration::from_millis(30)).await;
+                        owner.join().unwrap();
+                        assert_eq!(disk(dir.path()), state);
+                        eprintln!(
+                            "session-save background={background} trial={trial} workspaces=20 tabs=55 lock_ms=1200 elapsed_ms={:.3} heartbeat_max_gap_ms={:.3} heartbeat_ticks={}",
+                            save_elapsed.as_secs_f64() * 1000.0,
+                            max_gap.get().as_secs_f64() * 1000.0,
+                            ticks.get(),
+                        );
+                    });
+                    heartbeat.abort();
+                })
+                .unwrap();
+        }
+    }
+}
+
 fn split_workspace(ratio: f64) -> WorkspaceState {
     let mut state = workspace(1);
     state.layout = LayoutNodeState::Split(SplitState {

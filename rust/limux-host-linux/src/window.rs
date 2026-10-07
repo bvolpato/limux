@@ -30,6 +30,7 @@ use crate::workspace_color::{self, WorkspaceColor};
 
 const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
 const PANE_CREATE_COMMAND_READY_ATTEMPTS: u32 = 40;
+const SESSION_SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 // ---------------------------------------------------------------------------
 // State
@@ -105,9 +106,11 @@ pub(crate) struct AppState {
     sidebar_expanded_width: i32,
     persistence_suspended: bool,
     save_queued: bool,
-    session_store: Result<crate::session_store::SessionStore, String>,
+    session_save_timer: Option<glib::SourceId>,
+    session_store: Result<Option<crate::session_store::SessionStore>, String>,
     session_save_notice: Option<String>,
     session_close_dialog_open: bool,
+    session_close_pending: Option<SessionCloseMode>,
     close_after_recovery: bool,
     workspace_dragging: Option<String>,
     desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
@@ -917,7 +920,13 @@ impl PortalColorSchemePreference {
 enum SessionSaveRequest {
     Ignore,
     RetryOnIdle,
-    FlushOnIdle,
+    Schedule,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionCloseMode {
+    Save,
+    AcceptRecovery,
 }
 
 trait SessionSaveAccess {
@@ -949,7 +958,7 @@ fn queue_session_save_request<T: SessionSaveAccess>(state: &Rc<RefCell<T>>) -> S
         SessionSaveRequest::Ignore
     } else {
         s.set_save_queued(true);
-        SessionSaveRequest::FlushOnIdle
+        SessionSaveRequest::Schedule
     }
 }
 
@@ -962,11 +971,13 @@ fn request_session_save(state: &State) {
                 request_session_save(&state);
             });
         }
-        SessionSaveRequest::FlushOnIdle => {
-            let state = state.clone();
-            glib::idle_add_local_once(move || {
+        SessionSaveRequest::Schedule => {
+            let callback_state = state.clone();
+            let timer = glib::timeout_add_local_once(SESSION_SAVE_DELAY, move || {
+                let state = callback_state;
                 let should_save = {
                     let mut s = state.borrow_mut();
+                    s.session_save_timer.take();
                     let should_save = s.save_queued && !s.persistence_suspended;
                     s.save_queued = false;
                     should_save
@@ -975,21 +986,9 @@ fn request_session_save(state: &State) {
                     save_session_now(&state);
                 }
             });
+            state.borrow_mut().session_save_timer = Some(timer);
         }
     }
-}
-
-fn try_save_session(state: &State) -> Result<crate::session_store::SaveOutcome, String> {
-    let session = snapshot_session_state(state);
-    state
-        .borrow_mut()
-        .session_store
-        .as_mut()
-        .map_err(|error| {
-            format!("Session storage could not be opened: {error}. Resolve the storage error and restart before making session changes.")
-        })?
-        .save(&session)
-        .map_err(|error| error.to_string())
 }
 
 fn session_conflict_detail(recovery: &Path, workspaces: &[String]) -> String {
@@ -1006,7 +1005,79 @@ fn report_session_save_notice(state: &State, detail: String) {
 }
 
 fn save_session_now(state: &State) {
-    match try_save_session(state) {
+    let store = {
+        let mut s = state.borrow_mut();
+        if s.persistence_suspended {
+            return;
+        }
+        if let Some(timer) = s.session_save_timer.take() {
+            timer.remove();
+        }
+        if s.session_close_dialog_open {
+            s.save_queued = true;
+            return;
+        }
+        s.save_queued = false;
+        match s.session_store.as_mut() {
+            Ok(store) => match store.take() {
+                Some(store) => Ok(store),
+                None => {
+                    // The in-flight writer owns the store and its merge ancestry.
+                    // Its completion captures the latest GTK state before saving again.
+                    s.save_queued = true;
+                    return;
+                }
+            },
+            Err(error) => Err(format!("Session storage could not be opened: {error}. Resolve the storage error and restart before making session changes.")),
+        }
+    };
+    let store = match store {
+        Ok(store) => store,
+        Err(error) => {
+            finish_session_save(state, Err(error));
+            return;
+        }
+    };
+    let session = snapshot_session_state(state);
+    let task = store.save_in_background(session);
+    let state = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let result = match task.await {
+            Ok((store, saved_session, result)) => {
+                state.borrow_mut().session_store = Ok(Some(store));
+                // A close request must include changes made while the worker was
+                // saving, including control-socket commands behind a modal dialog.
+                let closing = state.borrow().session_close_pending.is_some();
+                if closing && result.is_ok() && snapshot_session_state(&state) != saved_session {
+                    save_session_now(&state);
+                    return;
+                }
+                result.map_err(|error| error.to_string())
+            }
+            Err(_) => {
+                let error = "Session writer stopped unexpectedly".to_string();
+                state.borrow_mut().session_store = Err(error.clone());
+                Err(error)
+            }
+        };
+        finish_session_save(&state, result);
+        let pending = {
+            let s = state.borrow();
+            s.save_queued && s.session_save_timer.is_none() && !s.session_close_dialog_open
+        };
+        if pending {
+            save_session_now(&state);
+        }
+    });
+}
+
+fn finish_session_save(state: &State, result: Result<crate::session_store::SaveOutcome, String>) {
+    let closing = state.borrow_mut().session_close_pending.take();
+    if let Some(mode) = closing {
+        finish_session_close(state, mode, result);
+        return;
+    }
+    match result {
         Ok(crate::session_store::SaveOutcome::Saved) => {
             state.borrow_mut().session_save_notice = None
         }
@@ -1024,11 +1095,38 @@ fn prepare_session_close(state: &State) -> bool {
     if std::mem::take(&mut state.borrow_mut().close_after_recovery) {
         return true;
     }
-    if state.borrow().session_close_dialog_open {
+    if state.borrow().session_close_dialog_open || state.borrow().session_close_pending.is_some() {
         return false;
     }
-    match try_save_session(state) {
-        Ok(crate::session_store::SaveOutcome::Saved) => true,
+    state.borrow_mut().session_close_pending = Some(SessionCloseMode::Save);
+    save_session_now(state);
+    false
+}
+
+fn close_after_session_save(state: &State) {
+    state.borrow_mut().close_after_recovery = true;
+    let window = state.borrow().window.clone();
+    window.close();
+}
+
+fn resume_session_saves(state: &State) {
+    {
+        let mut s = state.borrow_mut();
+        s.save_queued = false;
+        if let Some(timer) = s.session_save_timer.take() {
+            timer.remove();
+        }
+    }
+    request_session_save(state);
+}
+
+fn finish_session_close(
+    state: &State,
+    mode: SessionCloseMode,
+    result: Result<crate::session_store::SaveOutcome, String>,
+) {
+    match result {
+        Ok(crate::session_store::SaveOutcome::Saved) => close_after_session_save(state),
         Err(error) => {
             let window = state.borrow().window.clone();
             let dialog = gtk::AlertDialog::builder().modal(true)
@@ -1040,17 +1138,20 @@ fn prepare_session_close(state: &State) -> bool {
             dialog.choose(Some(&window), gio::Cancellable::NONE, move |answer| {
                 state.borrow_mut().session_close_dialog_open = false;
                 if answer == Ok(1) {
-                    state.borrow_mut().close_after_recovery = true;
-                    let window = state.borrow().window.clone();
-                    window.close();
+                    close_after_session_save(&state);
+                } else {
+                    resume_session_saves(&state);
                 }
             });
-            false
         }
         Ok(crate::session_store::SaveOutcome::Conflict {
             recovery,
             workspaces,
         }) => {
+            if mode == SessionCloseMode::AcceptRecovery {
+                close_after_session_save(state);
+                return;
+            }
             let detail = session_conflict_detail(&recovery, &workspaces);
             let window = state.borrow().window.clone();
             let dialog = gtk::AlertDialog::builder()
@@ -1066,23 +1167,14 @@ fn prepare_session_close(state: &State) -> bool {
             dialog.choose(Some(&window), gio::Cancellable::NONE, move |answer| {
                 state.borrow_mut().session_close_dialog_open = false;
                 if answer != Ok(1) {
+                    resume_session_saves(&state);
                     return;
                 }
                 // Control-socket commands can still change the session while the
                 // dialog is open. Capture the latest state before allowing close.
-                match try_save_session(&state) {
-                    Ok(_) => {
-                        state.borrow_mut().close_after_recovery = true;
-                        let window = state.borrow().window.clone();
-                        window.close();
-                    }
-                    Err(error) => report_session_save_notice(
-                        &state,
-                        format!("Failed to save recovery session: {error}"),
-                    ),
-                }
+                state.borrow_mut().session_close_pending = Some(SessionCloseMode::AcceptRecovery);
+                save_session_now(&state);
             });
-            false
         }
     }
 }
@@ -1095,6 +1187,9 @@ fn stop_session_saves_for_shutdown(state: &State) {
     let mut s = state.borrow_mut();
     s.save_queued = false;
     s.persistence_suspended = true;
+    if let Some(timer) = s.session_save_timer.take() {
+        timer.remove();
+    }
 }
 
 fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
@@ -1102,16 +1197,10 @@ fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
 
     apply_top_bar_state_immediately(state, loaded.state.top_bar_visible);
 
+    let restorable_agents = layout_state::RestorableAgentIndex::load();
     let restored_any = !loaded.state.workspaces.is_empty();
     if restored_any {
-        let restorable_agents = layout_state::RestorableAgentIndex::load();
-        for workspace in &mut loaded.state.workspaces {
-            layout_state::attach_restorable_agents_to_layout(
-                &mut workspace.layout,
-                workspace.id.as_deref().unwrap_or(""),
-                &restorable_agents,
-            );
-        }
+        layout_state::attach_restorable_agents_to_session(&mut loaded.state, &restorable_agents);
         for workspace in &loaded.state.workspaces {
             add_workspace_from_state(state, workspace);
         }
@@ -1125,8 +1214,9 @@ fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
     }
     apply_sidebar_state_immediately(state, &loaded.state.sidebar);
 
-    let restored = snapshot_session_state(state);
-    if let Ok(store) = state.borrow_mut().session_store.as_mut() {
+    let mut restored = snapshot_session_state(state);
+    layout_state::attach_restorable_agents_to_session(&mut restored, &restorable_agents);
+    if let Ok(Some(store)) = state.borrow_mut().session_store.as_mut() {
         store.restored(restored);
     }
     suspend_persistence(state, false);
@@ -1185,7 +1275,6 @@ fn apply_top_bar_state_immediately(state: &State, visible: bool) {
 
 fn snapshot_session_state(state: &State) -> AppSessionState {
     let s = state.borrow();
-    let restorable_agents = layout_state::RestorableAgentIndex::load();
     let sidebar_visible = sidebar_is_visible(&s);
     let sidebar_width = if sidebar_visible {
         sidebar_width(&s.sidebar_shell)
@@ -1201,15 +1290,10 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
             let cwd = workspace.cwd.borrow().clone();
             let folder_path = workspace.folder_path.clone();
             let working_directory = folder_path.clone().or(cwd.clone());
-            let mut layout = workspace
+            let layout = workspace
                 .split_container
                 .tree()
                 .snapshot(working_directory.as_deref());
-            layout_state::attach_restorable_agents_to_layout(
-                &mut layout,
-                &workspace.id,
-                &restorable_agents,
-            );
             WorkspaceState {
                 id: Some(workspace.id.clone()),
                 name: workspace.name.clone(),
@@ -2096,9 +2180,11 @@ pub fn build_window(app: &adw::Application) {
         sidebar_expanded_width: SIDEBAR_WIDTH,
         persistence_suspended: false,
         save_queued: false,
+        session_save_timer: None,
         session_store: Err("Session storage has not been initialized".to_string()),
         session_save_notice: None,
         session_close_dialog_open: false,
+        session_close_pending: None,
         close_after_recovery: false,
         workspace_dragging: None,
         desktop_notification_routes: HashMap::new(),
@@ -2298,7 +2384,7 @@ pub fn build_window(app: &adw::Application) {
 
     match crate::session_store::SessionStore::load() {
         Ok((store, loaded)) => {
-            state.borrow_mut().session_store = Ok(store);
+            state.borrow_mut().session_store = Ok(Some(store));
             apply_loaded_session(&state, loaded);
         }
         Err(error) => {
@@ -2307,7 +2393,7 @@ pub fn build_window(app: &adw::Application) {
                 Ok((store, loaded)) => {
                     // This is the snapshot we actually show, not a new disk
                     // baseline adopted after the user has begun making edits.
-                    state.borrow_mut().session_store = Ok(store);
+                    state.borrow_mut().session_store = Ok(Some(store));
                     apply_loaded_session(&state, loaded);
                 }
                 Err(retry_error) => {
@@ -8486,7 +8572,7 @@ mod tests {
 
         assert_eq!(
             queue_session_save_request(&state),
-            SessionSaveRequest::FlushOnIdle
+            SessionSaveRequest::Schedule
         );
         assert!(state.borrow().save_queued);
         assert_eq!(
@@ -9237,3 +9323,7 @@ mod pane_create_tests;
 #[cfg(test)]
 #[path = "pane_close_tests.rs"]
 mod pane_close_tests;
+
+#[cfg(test)]
+#[path = "session_save_tests.rs"]
+mod session_save_tests;

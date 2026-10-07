@@ -102,6 +102,19 @@ impl SessionStore {
         self.local = layout_state::normalize_session(local);
     }
 
+    pub(crate) fn save_in_background(
+        mut self,
+        local: AppSessionState,
+    ) -> gtk4::gio::JoinHandle<(Self, AppSessionState, io::Result<SaveOutcome>)> {
+        gtk4::gio::spawn_blocking(move || {
+            let mut persisted = local.clone();
+            let agents = layout_state::RestorableAgentIndex::load();
+            layout_state::attach_restorable_agents_to_session(&mut persisted, &agents);
+            let result = self.save(&persisted);
+            (self, local, result)
+        })
+    }
+
     pub(crate) fn save(&mut self, local: &AppSessionState) -> io::Result<SaveOutcome> {
         let _lock = lock_directory(&self.directory)?;
         let disk = read_session(&self.directory)?.state;
