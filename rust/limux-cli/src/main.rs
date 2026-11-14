@@ -231,7 +231,7 @@ Common commands:
   focus-surface [--workspace <id|ref>] [--surface <id|ref>]
   focus-pane [--workspace <id|ref>] [--pane <id|ref>]
   new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]
-      Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.
+      Supports terminal and browser panes on both the live GTK host and standalone server.
   rename-workspace [--workspace <id|ref>] <title>
   set-workspace-color [--workspace <id|ref>] <red|orange|amber|green|teal|blue|purple|pink|none>
   list-groups
@@ -692,47 +692,6 @@ async fn browser_call(
         params.insert("surface_id".to_string(), Value::String(surface));
     }
     client.call(method, Value::Object(params)).await
-}
-
-async fn selected_surface_for_pane(
-    client: &mut Client,
-    workspace: Option<String>,
-    pane_id: &str,
-) -> Result<String> {
-    let payload = call_in_workspace_scope(
-        client,
-        workspace,
-        "pane.surfaces",
-        json!({ "pane_id": pane_id }),
-    )
-    .await?;
-    let rows = payload
-        .get("surfaces")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("pane.surfaces returned no surfaces"))?;
-
-    for row in rows {
-        let focused = row.get("focused").and_then(Value::as_bool).unwrap_or(false)
-            || row
-                .get("selected")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-        if focused {
-            let handle = handle_from_payload(row, "surface_id", "surface_ref");
-            if !handle.is_empty() {
-                return Ok(handle);
-            }
-        }
-    }
-
-    let first = rows
-        .first()
-        .ok_or_else(|| anyhow!("pane has no surfaces"))?;
-    let handle = handle_from_payload(first, "surface_id", "surface_ref");
-    if handle.is_empty() {
-        bail!("pane.surfaces returned an empty surface handle");
-    }
-    Ok(handle)
 }
 
 fn window_activation_params(activation_token: Option<&str>, startup_id: Option<&str>) -> Value {
@@ -2765,8 +2724,8 @@ fn build_agents_md(
     out.push_str(
         "`new-pane` reads `LIMUX_WORKSPACE_ID`, `LIMUX_SURFACE_ID`, and\n\
          `LIMUX_PANE_ID`, so it splits your current pane even if GTK focus has\n\
-         moved elsewhere. Live GTK self-spawn currently supports terminal\n\
-         panes only; browser pane creation is deferred.\n\n",
+         moved elsewhere. Live GTK self-spawn supports both terminal and browser\n\
+         panes (`--type browser --url <url>`).\n\n",
     );
 
     out.push_str("## Policies (edit these freely)\n\n");
@@ -3004,26 +2963,34 @@ async fn run_new_pane(client: &mut Client, args: &[String]) -> Result<Value> {
     call_in_workspace_scope(client, workspace, "pane.create", params).await
 }
 
-async fn run_read_screen(client: &mut Client, args: &[String]) -> Result<Value> {
-    if let Some(lines) = parse_opt(args, "--lines") {
-        if lines.parse::<u64>().unwrap_or(0) == 0 {
-            bail!("--lines must be greater than 0");
-        }
+fn build_read_screen_params(args: &[String]) -> Result<Value> {
+    let mut params = Map::new();
+    if let Some(raw_lines) = parse_opt(args, "--lines") {
+        let lines = raw_lines
+            .parse::<u64>()
+            .ok()
+            .filter(|&lines| lines > 0)
+            .ok_or_else(|| anyhow!("--lines must be greater than 0"))?;
+        params.insert("lines".to_string(), Value::Number(lines.into()));
+    } else if parse_flag(args, "--lines") {
+        bail!("--lines must be greater than 0");
     }
 
-    let workspace = parse_opt(args, "--workspace");
-    let surface = parse_terminal_surface(args)?;
-    let mut params = Map::new();
-    if let Some(workspace) = workspace {
+    if parse_flag(args, "--scrollback") {
+        params.insert("scrollback".to_string(), Value::Bool(true));
+    }
+    if let Some(workspace) = parse_opt(args, "--workspace") {
         params.insert("workspace_id".to_string(), Value::String(workspace));
     }
-    if let Some(surface) = surface {
+    if let Some(surface) = parse_terminal_surface(args)? {
         params.insert("surface_id".to_string(), Value::String(surface));
     }
+    Ok(Value::Object(params))
+}
 
-    client
-        .call("surface.read_text", Value::Object(params))
-        .await
+async fn run_read_screen(client: &mut Client, args: &[String]) -> Result<Value> {
+    let params = build_read_screen_params(args)?;
+    client.call("surface.read_text", params).await
 }
 
 /// Build the `workspace.set_color` params; the host validates the colour name.
@@ -3925,6 +3892,97 @@ fn is_unsupported_tmux_cmd(cmd: &str) -> bool {
     matches!(cmd, "popup" | "bind-key" | "unbind-key" | "copy-mode")
 }
 
+fn is_gui_hook_event_name(name: &str) -> bool {
+    matches!(
+        name,
+        "on-workspace-create"
+            | "after-workspace-create"
+            | "on-workspace-delete"
+            | "after-workspace-delete"
+    )
+}
+
+fn parse_set_hook_options(args: &[String]) -> (bool, Option<String>) {
+    let mut list_mode = false;
+    let mut unset = None;
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg == "--" {
+            break;
+        }
+        if arg == "--list" {
+            list_mode = true;
+            idx += 1;
+            continue;
+        }
+        if arg == "--unset" {
+            unset = args.get(idx + 1).cloned();
+            idx += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--unset=") {
+            unset = Some(val.to_string());
+            idx += 1;
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "--workspace" | "--surface" | "--pane" | "--tab" | "-t"
+        ) {
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    (list_mode, unset)
+}
+
+fn parse_set_hook_positional(args: &[String]) -> Result<(String, String)> {
+    let mut idx = 0;
+    let mut name: Option<String> = None;
+    let mut options_ended = false;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if !options_ended {
+            if arg == "--" {
+                options_ended = true;
+                idx += 1;
+                continue;
+            }
+            if matches!(
+                arg.as_str(),
+                "--workspace" | "--unset" | "--surface" | "--pane" | "--tab" | "-t"
+            ) {
+                idx += 2;
+                continue;
+            }
+            if arg == "--list" || arg.starts_with('-') {
+                idx += 1;
+                continue;
+            }
+        }
+        name = Some(arg.clone());
+        idx += 1;
+        break;
+    }
+    let Some(name) = name else {
+        bail!("set-hook requires <name> <command>");
+    };
+    if !options_ended && args.get(idx).map(String::as_str) == Some("--") {
+        idx += 1;
+    }
+    let body = args.get(idx..).unwrap_or_default().join(" ");
+    if name.trim().is_empty() || body.trim().is_empty() {
+        bail!("set-hook requires <name> <command>");
+    }
+    Ok((name, body))
+}
+
 async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) -> Result<Value> {
     if is_unsupported_tmux_cmd(command) {
         bail!("not supported");
@@ -4023,27 +4081,13 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             let target = parse_opt(args, "--target-pane")
                 .ok_or_else(|| anyhow!("swap-pane requires --target-pane"))?;
 
-            let source_surface =
-                selected_surface_for_pane(client, workspace.clone(), &pane).await?;
-            let target_surface =
-                selected_surface_for_pane(client, workspace.clone(), &target).await?;
-
-            let _ = call_in_workspace_scope(
+            call_in_workspace_scope(
                 client,
-                workspace.clone(),
-                "surface.move",
-                json!({"surface_id": source_surface, "target_pane_id": target, "index": 0}),
+                workspace,
+                "pane.swap",
+                json!({"pane_id": pane, "target_pane_id": target}),
             )
-            .await?;
-            let _ = call_in_workspace_scope(
-                client,
-                workspace.clone(),
-                "surface.move",
-                json!({"surface_id": target_surface, "target_pane_id": pane, "index": 0}),
-            )
-            .await?;
-
-            Ok(json!({"ok": true}))
+            .await
         }
         "break-pane" => {
             let workspace = parse_opt(args, "--workspace");
@@ -4089,34 +4133,78 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
                 .await
         }
         "set-hook" => {
-            let list_mode = parse_flag(args, "--list");
-            let unset = parse_opt(args, "--unset");
-            with_locked_json_map(&client.socket, "hooks", |hooks, path| {
-                if list_mode {
-                    let text = hooks
+            let (list_mode, unset) = parse_set_hook_options(args);
+            if list_mode {
+                let gui_entries = client
+                    .call("gui_hook.list", json!({}))
+                    .await
+                    .ok()
+                    .and_then(|payload| {
+                        payload.get("hooks").and_then(Value::as_array).map(|hooks| {
+                            hooks
+                                .iter()
+                                .filter(|hook| {
+                                    hook.get("configured").and_then(Value::as_bool) == Some(true)
+                                })
+                                .filter_map(|hook| {
+                                    let event = get_string(hook, &["event"])?;
+                                    let command = get_string(hook, &["command"])?;
+                                    Some((event, command))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .unwrap_or_default();
+                return with_locked_json_map(&client.socket, "hooks", |hooks, path| {
+                    let mut merged = hooks.clone();
+                    for (event, command) in gui_entries {
+                        merged.insert(event, command);
+                    }
+                    let text = merged
                         .iter()
                         .map(|(k, v)| format!("{}={}", k, v))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    return Ok(json!({
+                    Ok(json!({
                         "text": text,
                         "path": path.display().to_string(),
-                    }));
-                }
-                if let Some(name) = unset {
-                    hooks.remove(&name);
-                    write_json_map(path, hooks)?;
+                    }))
+                });
+            }
+            if let Some(name) = unset {
+                if is_gui_hook_event_name(&name)
+                    && client
+                        .call("gui_hook.clear", json!({ "event": name }))
+                        .await
+                        .is_ok()
+                {
+                    let _ = with_locked_json_map(&client.socket, "hooks", |hooks, path| {
+                        if hooks.remove(&name).is_some() {
+                            write_json_map(path, hooks)?;
+                        }
+                        Ok(json!({"ok": true}))
+                    });
                     return Ok(json!({"ok": true}));
                 }
-                let name = args
-                    .iter()
-                    .find(|a| !a.starts_with('-'))
-                    .cloned()
-                    .unwrap_or_default();
-                let body = trailing_title(args).unwrap_or_default();
-                if name.is_empty() || body.is_empty() {
-                    bail!("set-hook requires <name> <command>");
-                }
+                return with_locked_json_map(&client.socket, "hooks", |hooks, path| {
+                    hooks.remove(&name);
+                    write_json_map(path, hooks)?;
+                    Ok(json!({"ok": true}))
+                });
+            }
+            let (name, body) = parse_set_hook_positional(args)?;
+            if is_gui_hook_event_name(&name)
+                && client
+                    .call(
+                        "gui_hook.set",
+                        json!({ "event": name, "command": body, "enabled": true }),
+                    )
+                    .await
+                    .is_ok()
+            {
+                return Ok(json!({"ok": true}));
+            }
+            with_locked_json_map(&client.socket, "hooks", |hooks, path| {
                 hooks.insert(name, body);
                 write_json_map(path, hooks)?;
                 Ok(json!({"ok": true}))
@@ -5290,6 +5378,7 @@ mod cli_arg_tests {
                     }
                     "tab-action" => args(&["tab-action", "--action", "pin"]),
                     "rename-tab" => args(&["rename-tab", "Title"]),
+                    "swap-pane" => args(&["swap-pane", "--pane", "1", "--target-pane", "2"]),
                     "join-pane" => args(&["join-pane", "--target-pane", "2"]),
                     "resize-pane" => args(&["resize-pane", "--pane", "1"]),
                     "open-browser" => args(&["open-browser", "https://example.com"]),
@@ -5486,7 +5575,7 @@ mod agent_team_tests {
         assert!(md.contains("LIMUX_WORKSPACE_ID"));
         assert!(md.contains("LIMUX_SURFACE_ID"));
         assert!(md.contains("limux new-pane --direction right --command bash"));
-        assert!(md.contains("Live GTK self-spawn currently supports terminal"));
+        assert!(md.contains("Live GTK self-spawn supports both terminal and browser"));
     }
 }
 
@@ -5827,6 +5916,147 @@ mod new_pane_tests {
             "group:a Backend (blue, 2 workspaces)\ngroup:b Docs (teal, 1 workspace, collapsed)"
         );
         assert_eq!(render_group_list(&json!({ "groups": [] })), "No groups");
+    }
+
+    #[test]
+    fn read_screen_params_forward_scrollback_and_lines() {
+        assert_eq!(
+            build_read_screen_params(&args(&[
+                "--workspace",
+                "ws-1",
+                "--surface",
+                "4:tab-a",
+                "--scrollback",
+                "--lines",
+                "80",
+            ]))
+            .unwrap(),
+            json!({
+                "workspace_id": "ws-1",
+                "surface_id": "4:tab-a",
+                "scrollback": true,
+                "lines": 80,
+            })
+        );
+        assert_eq!(build_read_screen_params(&args(&[])).unwrap(), json!({}));
+        assert!(build_read_screen_params(&args(&["--lines", "0"])).is_err());
+        assert!(build_read_screen_params(&args(&["--lines"])).is_err());
+    }
+
+    #[test]
+    fn set_hook_positional_separates_event_name_from_command_body() {
+        assert_eq!(
+            parse_set_hook_positional(&args(&["after-workspace-create", "echo", "ready"])).unwrap(),
+            (
+                "after-workspace-create".to_string(),
+                "echo ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(&[
+                "after-workspace-create",
+                "bash",
+                "-lc",
+                "echo ready",
+            ]))
+            .unwrap(),
+            (
+                "after-workspace-create".to_string(),
+                "bash -lc echo ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(&[
+                "after-workspace-create",
+                "notify-send",
+                "-u",
+                "critical",
+                "Done",
+            ]))
+            .unwrap(),
+            (
+                "after-workspace-create".to_string(),
+                "notify-send -u critical Done".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(&[
+                "--workspace",
+                "ws1",
+                "on-workspace-create",
+                "echo",
+                "-n",
+                "ready",
+            ]))
+            .unwrap(),
+            (
+                "on-workspace-create".to_string(),
+                "echo -n ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(&[
+                "--workspace=ws1",
+                "-g",
+                "on-workspace-create",
+                "echo",
+                "-n",
+                "ready",
+            ]))
+            .unwrap(),
+            (
+                "on-workspace-create".to_string(),
+                "echo -n ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_positional(&args(
+                &["on-workspace-create", "--", "echo", "-n", "ready",]
+            ))
+            .unwrap(),
+            (
+                "on-workspace-create".to_string(),
+                "echo -n ready".to_string()
+            )
+        );
+        assert_eq!(
+            parse_set_hook_options(&args(&[
+                "on-workspace-create",
+                "cmd",
+                "--list",
+                "--unset",
+                "x"
+            ])),
+            (false, None)
+        );
+        assert_eq!(
+            parse_set_hook_options(&args(&["--workspace", "ws1", "--list"])),
+            (true, None)
+        );
+        assert_eq!(
+            parse_set_hook_options(&args(&["--unset", "on-workspace-create"])),
+            (false, Some("on-workspace-create".to_string()))
+        );
+        assert!(parse_set_hook_positional(&args(&["only-name"])).is_err());
+        assert!(parse_set_hook_positional(&args(&["on-workspace-create", "--"])).is_err());
+        assert!(is_gui_hook_event_name("on-workspace-create"));
+        assert!(!is_gui_hook_event_name("pane-focus-in"));
+    }
+
+    #[test]
+    fn new_pane_serializes_browser_type_and_url() {
+        let (_, params) = build_new_pane_request(
+            &args(&["--type", "browser", "--url", "https://example.com"]),
+            |_| None,
+        );
+        assert_eq!(
+            params,
+            json!({
+                "direction": "right",
+                "type": "browser",
+                "url": "https://example.com"
+            })
+        );
     }
 
     #[test]

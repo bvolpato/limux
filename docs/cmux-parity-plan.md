@@ -13,10 +13,11 @@ Limux has **two control servers**:
    the live GTK command set defined in
    `limux_protocol::methods::GTK_BRIDGE_COMMAND_NAMES` to the GTK main loop,
    including `system.{ping,identify,capabilities}`, `window.activate`,
-   `workspace.{current,list,create,select,rename,close,set_color,set_group}`,
+   `workspace.{current,list,create,select,next,previous,last,rename,close,set_color,set_group}`,
    `workspace.group_{list,create,rename,set_color,set_collapsed,delete}`,
-   `pane.{list,surfaces,create,focus}`,
-   `surface.{list,create,close,focus,send_text,send_key,read_text,health}`,
+   `pane.{list,surfaces,create,focus,swap,break,join,last,resize}`,
+   `surface.{list,create,close,focus,send_text,send_key,read_text,clear_history,health}`,
+   `browser.{open_split,navigate,url.get,back,forward,reload}`,
    `tab.action`, `gui_hook.{list,set,clear}`, and `notification.create`.
    Canonical method metadata, socket `wire_aliases`, and `cli_subcommands` are
    cataloged in `rust/limux-protocol/src/methods.rs`.
