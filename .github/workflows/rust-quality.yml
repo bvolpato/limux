@@ -1,13 +1,61 @@
 name: Rust Quality
+run-name: "${{ github.event_name == 'workflow_dispatch' && format('Rust Quality dispatch PR #{0} at {1}', inputs.pull_request_number, inputs.pull_request_sha) || format('Rust Quality {0}', github.event_name) }}"
 
 on:
   push:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Open pull request number to render
+        required: true
+        type: string
+      pull_request_sha:
+        description: Exact current head commit SHA of that pull request
+        required: true
+        type: string
+  schedule:
+    - cron: "17 9 * * *"
+
+permissions:
+  contents: read
 
 jobs:
+  audit:
+    if: github.event_name != 'workflow_dispatch'
+    name: Dependency audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install pinned cargo-audit
+        env:
+          CARGO_AUDIT_VERSION: 0.22.2
+          CARGO_AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+        run: |
+          set -euo pipefail
+          asset="cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}.tgz"
+          archive="$RUNNER_TEMP/$asset"
+          install_dir="$RUNNER_TEMP/cargo-audit"
+          bin_dir="$RUNNER_TEMP/bin"
+          curl --fail --location --retry 5 --retry-delay 5 \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v${CARGO_AUDIT_VERSION}/${asset}" \
+            -o "$archive"
+          printf '%s  %s\n' "$CARGO_AUDIT_SHA256" "$archive" | sha256sum --check
+          mkdir -p "$install_dir" "$bin_dir"
+          tar -xzf "$archive" -C "$install_dir" --strip-components=1
+          install -m755 "$install_dir/cargo-audit" "$bin_dir/cargo-audit"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+
+      - name: Audit locked dependencies
+        run: cargo audit --deny warnings
+
   quality:
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     steps:
@@ -40,15 +88,14 @@ jobs:
             pkg-config
 
       - name: Build libghostty for embedding
-        run: |
-          cd ghostty
-          zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline
+        run: ./scripts/build-ghostty.sh
 
       - name: Run repository quality checks
         run: ./scripts/check.sh
 
   gtk-host-smoke:
     name: GTK host smoke
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
 
     steps:
@@ -67,6 +114,11 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Install uv for X11 input regression
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.11.15"
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -80,16 +132,213 @@ jobs:
             libgl1-mesa-dri \
             libgtk-4-dev \
             libwebkitgtk-6.0-dev \
+            metacity \
+            imagemagick \
+            ibus \
+            ibus-gtk4 \
             pkg-config \
+            tmux \
             util-linux \
-            weston
+            weston \
+            xauth \
+            x11-utils \
+            xdotool \
+            xinput \
+            xvfb
 
       - name: Build libghostty for embedding
-        run: |
-          cd ghostty
-          zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline
+        run: ./scripts/build-ghostty.sh
+
+      - name: Check terminal IBus lifecycle
+        run: ./scripts/tests/test-terminal-ime-lifecycle.sh
 
       - name: Run live GTK host smoke test
         env:
           LIMUX_SMOKE_PROFILE: debug
         run: ./scripts/xvfb-smoke-test.sh
+
+      - name: Check X11 input-seat removal
+        run: uv run scripts/tests/test-input-seat-removal.py
+
+      - name: Check terminal directory inheritance
+        run: ./scripts/tests/test-terminal-cwd.sh
+
+      - name: Check tab double-click rename
+        run: ./scripts/tests/test-tab-rename.sh
+
+      - name: Check existing-window activation
+        run: ./scripts/tests/test-window-activate.sh
+
+      - name: Check workspace row clicks and inline rename focus after switching
+        timeout-minutes: 3
+        env:
+          LIMUX_TEST_ARTIFACT_DIR: ${{ runner.temp }}/limux-rename-focus
+        run: ./scripts/tests/test-workspace-rename-focus.sh
+
+      - name: Upload inline rename test captures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: limux-rename-focus
+          path: ${{ runner.temp }}/limux-rename-focus/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Capture Limux visual smoke states
+        if: always() && !cancelled()
+        timeout-minutes: 5
+        env:
+          LIMUX_VISUAL_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/limux-visual-smoke
+          LIMUX_VISUAL_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: ./scripts/tests/visual-smoke-test.sh
+
+      - name: Upload visual smoke gallery
+        id: visual-gallery
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: limux-visual-smoke
+          path: ${{ runner.temp }}/limux-visual-smoke/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Add gallery link to the run summary
+        if: always() && steps.visual-gallery.outputs.artifact-url != ''
+        env:
+          ARTIFACT_URL: ${{ steps.visual-gallery.outputs.artifact-url }}
+        run: |
+          {
+            echo '### Limux visual smoke'
+            echo
+            echo "[Download screenshots and open the included HTML gallery]($ARTIFACT_URL)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  gtk-visual-smoke-dispatch:
+    name: GTK visual smoke dispatch
+    timeout-minutes: 30
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Check out trusted visual-smoke harness
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+
+      - name: Validate requested open PR head
+        id: pr
+        uses: actions/github-script@v9
+        env:
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          PR_SHA: ${{ inputs.pull_request_sha }}
+        with:
+          script: |
+            const numberText = process.env.PR_NUMBER;
+            const sha = process.env.PR_SHA;
+            if (!/^[1-9][0-9]*$/.test(numberText || '') || !/^[0-9a-f]{40}$/.test(sha || '')) {
+              core.setFailed('pull_request_number and pull_request_sha must identify an exact PR head.');
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const response = await github.rest.pulls.get({ owner, repo, pull_number: Number(numberText) });
+            const pr = response.data;
+            if (pr.state !== 'open' || pr.base.repo.full_name !== `${owner}/${repo}` ||
+                pr.base.ref !== 'main' || pr.head.sha !== sha) {
+              core.setFailed('The requested PR must be open against this main branch at the supplied exact head SHA.');
+              return;
+            }
+            core.setOutput('head_ref', `refs/pull/${pr.number}/head`);
+            core.setOutput('head_sha', pr.head.sha);
+
+      - name: Check out untrusted PR source without stored credentials
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.pr.outputs.head_ref }}
+          path: source
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify checked-out PR head
+        env:
+          EXPECTED_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: test "$(git -C source rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install uv for the browser fixture
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.11.15"
+
+      - name: Install visual-smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            blueprint-compiler \
+            build-essential \
+            dbus-x11 \
+            gettext \
+            imagemagick \
+            jq \
+            libadwaita-1-dev \
+            libepoxy-dev \
+            libgl1-mesa-dri \
+            libgtk-4-dev \
+            libwebkitgtk-6.0-dev \
+            metacity \
+            pkg-config \
+            util-linux \
+            xauth \
+            xdotool \
+            xvfb
+
+      - name: Build libghostty from requested PR source
+        working-directory: source
+        run: ./scripts/build-ghostty.sh
+
+      - name: Build GUI host and CLI from requested PR source
+        working-directory: source
+        run: cargo build --locked -p limux-cli -p limux-host-linux --bins
+
+      - name: Capture requested PR visual states with trusted harness
+        if: always() && !cancelled() && steps.pr.outputs.head_sha != ''
+        timeout-minutes: 5
+        env:
+          LIMUX_TEST_ROOT: ${{ github.workspace }}/source
+          LIMUX_VISUAL_SOURCE_SHA: ${{ steps.pr.outputs.head_sha }}
+          LIMUX_VISUAL_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/limux-visual-smoke
+        run: tooling/scripts/tests/visual-smoke-test.sh
+
+      - name: Upload visual smoke gallery
+        id: visual-gallery
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: limux-visual-smoke
+          path: ${{ runner.temp }}/limux-visual-smoke/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Add gallery link to the run summary
+        if: always() && steps.visual-gallery.outputs.artifact-url != ''
+        env:
+          ARTIFACT_URL: ${{ steps.visual-gallery.outputs.artifact-url }}
+        run: |
+          {
+            echo '### Limux visual smoke'
+            echo
+            echo "[Download screenshots and open the included HTML gallery]($ARTIFACT_URL)."
+          } >> "$GITHUB_STEP_SUMMARY"

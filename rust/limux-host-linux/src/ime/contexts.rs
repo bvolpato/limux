@@ -35,23 +35,40 @@ pub struct PaneIme {
     fallback_composing: Rc<Cell<bool>>,
 }
 
+impl PaneIme {
+    /// Bind only after GTK has created the widget's native surface.
+    pub fn attach(&self, gl_area: &gtk::GLArea) {
+        self.primary.set_client_widget(Some(gl_area));
+        self.fallback.set_client_widget(Some(gl_area));
+        if gl_area.has_focus() {
+            self.primary.focus_in();
+            self.fallback.focus_in();
+        }
+    }
+
+    /// Clear the client before unrealize removes its native surface. IBus
+    /// queues cursor-location work on focus_in, and focus_out does not cancel
+    /// that work. A detached context makes those callbacks return safely.
+    pub fn detach(&self) {
+        self.primary.focus_out();
+        self.fallback.focus_out();
+        self.primary.set_client_widget(gtk::Widget::NONE);
+        self.fallback.set_client_widget(gtk::Widget::NONE);
+    }
+}
+
 /// Build the two IM contexts for a terminal pane and wire their
 /// preedit / commit signals into a shared [`TerminalImeState`].
 ///
 /// The caller is responsible for routing keypresses through both
 /// contexts (see [`filter_key_event`]) and calling `focus_in` /
-/// `focus_out` / `set_client_widget(None)` on both at the right
-/// lifecycle points.
-pub fn create_pane_ime(
-    gl_area: &gtk::GLArea,
-    surface_cell: &Rc<RefCell<Option<ghostty_surface_t>>>,
-) -> PaneIme {
+/// `focus_out` on both. Call [`PaneIme::attach`] on realize and
+/// [`PaneIme::detach`] before unrealize and permanent shutdown.
+pub fn create_pane_ime(surface_cell: &Rc<RefCell<Option<ghostty_surface_t>>>) -> PaneIme {
     let primary = gtk::IMMulticontext::new();
-    primary.set_client_widget(Some(gl_area));
     primary.set_use_preedit(true);
 
     let fallback = gtk::IMContextSimple::new();
-    fallback.set_client_widget(Some(gl_area));
     fallback.set_use_preedit(true);
 
     let state = Rc::new(RefCell::new(TerminalImeState::default()));
@@ -170,6 +187,15 @@ pub fn send_committed_text(surface: ghostty_surface_t, text: &str) {
     }
 }
 
+/// Ghostty's preedit length is the number of UTF-8 bytes, not GTK's cursor
+/// position (which counts characters). Using the cursor position truncates
+/// multi-byte preedit text such as Hangul in the middle of a code point.
+fn preedit_payload(preedit: &str) -> Option<(CString, usize)> {
+    let text = CString::new(preedit).ok()?;
+    let byte_len = text.as_bytes().len();
+    Some((text, byte_len))
+}
+
 fn update_ghostty_preedit(
     surface_cell: &Rc<RefCell<Option<ghostty_surface_t>>>,
     im_context: &gtk::IMContext,
@@ -178,15 +204,15 @@ fn update_ghostty_preedit(
         return;
     };
 
-    let (preedit, _, cursor_pos) = im_context.preedit_string();
+    let (preedit, _, _) = im_context.preedit_string();
     if preedit.is_empty() {
         clear_ghostty_preedit(surface);
         return;
     }
 
-    if let Ok(text) = CString::new(preedit.as_str()) {
+    if let Some((text, byte_len)) = preedit_payload(preedit.as_str()) {
         unsafe {
-            ghostty_surface_preedit(surface, text.as_ptr(), cursor_pos.max(0) as usize);
+            ghostty_surface_preedit(surface, text.as_ptr(), byte_len);
         }
     }
 }
@@ -237,5 +263,19 @@ fn register_im_signal_handlers(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preedit_payload;
+
+    #[test]
+    fn hangul_preedit_passes_full_utf8_length_to_ghostty() {
+        for (preedit, expected_len) in [("ㅎ", 3), ("한", 3), ("한글", 6)] {
+            let (text, byte_len) = preedit_payload(preedit).expect("valid preedit");
+            assert_eq!(byte_len, expected_len);
+            assert_eq!(text.to_str().unwrap(), preedit);
+        }
     }
 }

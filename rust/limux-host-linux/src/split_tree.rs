@@ -78,6 +78,24 @@ impl SplitNode {
         }
     }
 
+    /// The pane nearest to `target` in the sibling that `remove` promotes.
+    fn successor_of(&self, target: &gtk::Widget) -> Option<gtk::Widget> {
+        let SplitNode::Split { left, right, .. } = self else {
+            return None;
+        };
+        let mut panes = Vec::new();
+        if matches!(left.as_ref(), SplitNode::Leaf { pane_widget } if pane_widget == target) {
+            right.collect_panes(&mut panes);
+            return panes.into_iter().next();
+        }
+        if matches!(right.as_ref(), SplitNode::Leaf { pane_widget } if pane_widget == target) {
+            left.collect_panes(&mut panes);
+            return panes.pop();
+        }
+        left.successor_of(target)
+            .or_else(|| right.successor_of(target))
+    }
+
     /// Find the leaf containing `target` and promote its sibling in place.
     pub(crate) fn remove(&mut self, target: &gtk::Widget) -> bool {
         match self {
@@ -147,7 +165,11 @@ pub(crate) struct SplitTreeContainer {
     tree: RefCell<SplitNode>,
     bin: gtk::Box,
     rebuild_source: RefCell<Option<glib::SourceId>>,
-    last_focused: RefCell<Option<gtk::Widget>>,
+    teardown_pending: Cell<bool>,
+    after_rebuild: RefCell<Vec<Box<dyn FnOnce()>>>,
+    /// Weak: `remove` saves the focus before a pane closes, and that focus is
+    /// usually inside the closing pane.
+    last_focused: RefCell<Option<glib::WeakRef<gtk::Widget>>>,
     zoomed_pane: RefCell<Option<gtk::Widget>>,
     state: State,
 }
@@ -166,6 +188,8 @@ impl SplitTreeContainer {
             }),
             bin,
             rebuild_source: RefCell::new(None),
+            teardown_pending: Cell::new(false),
+            after_rebuild: RefCell::default(),
             last_focused: RefCell::new(None),
             zoomed_pane: RefCell::new(None),
             state: state.clone(),
@@ -186,6 +210,8 @@ impl SplitTreeContainer {
             tree: RefCell::new(node),
             bin,
             rebuild_source: RefCell::new(None),
+            teardown_pending: Cell::new(false),
+            after_rebuild: RefCell::default(),
             last_focused: RefCell::new(None),
             zoomed_pane: RefCell::new(None),
             state: state.clone(),
@@ -207,6 +233,16 @@ impl SplitTreeContainer {
         self.tree.borrow().is_leaf()
     }
 
+    /// All pane widgets in this workspace, left-to-right / top-to-bottom.
+    ///
+    /// Used by the startup eager-restore sweep, which must reach panes that
+    /// are nested inside splits and not just the leading pane.
+    pub(crate) fn panes(&self) -> Vec<gtk::Widget> {
+        let mut panes = Vec::new();
+        self.tree.borrow().collect_panes(&mut panes);
+        panes
+    }
+
     pub(crate) fn retire_panes(&self) {
         let mut panes = Vec::new();
         self.tree.borrow().collect_panes(&mut panes);
@@ -215,9 +251,26 @@ impl SplitTreeContainer {
         }
     }
 
+    /// The pane on screen once the pending rebuild lands: the zoomed one, or
+    /// the model's first leaf.
+    pub(crate) fn shown_pane(&self) -> gtk::Widget {
+        if let Some(zoomed) = self.zoomed_pane.borrow().as_ref() {
+            return zoomed.clone();
+        }
+        let mut panes = Vec::new();
+        self.tree.borrow().collect_panes(&mut panes);
+        panes.swap_remove(0)
+    }
+
+    pub(crate) fn contains(&self, target: &gtk::Widget) -> bool {
+        self.tree.borrow().contains_pane(target)
+    }
+
     pub(crate) fn toggle_zoom(self: &Rc<Self>, target: &gtk::Widget) -> bool {
         if self.zoomed_pane.borrow().is_some() {
             self.restore_zoom();
+            false
+        } else if !self.contains(target) {
             false
         } else {
             self.zoom_pane(target);
@@ -235,7 +288,7 @@ impl SplitTreeContainer {
             return false;
         }
         self.zoomed_pane.borrow_mut().take();
-        *self.last_focused.borrow_mut() = Some(target.clone());
+        *self.last_focused.borrow_mut() = Some(target.downgrade());
         self.trigger_rebuild();
         true
     }
@@ -243,7 +296,7 @@ impl SplitTreeContainer {
     fn zoom_pane(self: &Rc<Self>, target: &gtk::Widget) {
         self.save_focus();
         *self.zoomed_pane.borrow_mut() = Some(target.clone());
-        *self.last_focused.borrow_mut() = Some(target.clone());
+        *self.last_focused.borrow_mut() = Some(target.downgrade());
         self.trigger_rebuild();
     }
 
@@ -266,13 +319,13 @@ impl SplitTreeContainer {
         new_pane_first: bool,
         ratio: f64,
     ) -> bool {
-        if !pane_has_room_to_split(target, orientation) {
+        if !self.contains(target) || !pane_has_room_to_split(target, orientation) {
             return false;
         }
 
         self.save_focus();
         self.zoomed_pane.borrow_mut().take();
-        *self.last_focused.borrow_mut() = Some(new_pane.clone());
+        *self.last_focused.borrow_mut() = Some(new_pane.downgrade());
 
         let shared_ratio = Rc::new(RefCell::new(layout_state::clamp_split_ratio(ratio)));
         let new_node = if new_pane_first {
@@ -315,35 +368,73 @@ impl SplitTreeContainer {
         self.save_focus();
         self.zoomed_pane.borrow_mut().take();
 
-        let removed = {
+        let (removed, successor) = {
             let mut tree = self.tree.borrow_mut();
-            tree.remove(target)
+            let successor = tree.successor_of(target);
+            (tree.remove(target), successor)
         };
 
         if removed {
+            // The focus was in the closed pane: the pane that takes its place
+            // gets it after the rebuild.
+            let focus = self
+                .last_focused
+                .borrow()
+                .as_ref()
+                .and_then(|w| w.upgrade());
+            if focus.is_some_and(|focus| &focus == target || focus.is_ancestor(target)) {
+                *self.last_focused.borrow_mut() = successor.map(|pane| pane.downgrade());
+            }
             self.trigger_rebuild();
         }
         removed
     }
 
+    /// Run `f` once the widget tree matches the model: at once, or after the
+    /// pending rebuild. Until then a new pane is in the model only, and pane
+    /// lookups, which search the workspace root, cannot find it.
+    pub(crate) fn after_pending_rebuild(&self, f: impl FnOnce() + 'static) {
+        if self.teardown_pending.get() || self.rebuild_source.borrow().is_some() {
+            self.after_rebuild.borrow_mut().push(Box::new(f));
+        } else {
+            f();
+        }
+    }
+
     /// Tear down the old widget tree and schedule a rebuild on the next idle
     /// tick. The one-tick separation between unrealize (teardown) and realize
-    /// (rebuild) is what prevents GLArea breakage.
+    /// (rebuild) is what prevents GLArea breakage. The teardown itself waits
+    /// for a frame without the old tree (see `terminal::detach_after_repaint`).
     fn trigger_rebuild(self: &Rc<Self>) {
         // Cancel any pending rebuild
         if let Some(source) = self.rebuild_source.take() {
             source.remove();
         }
-
-        // Clear the bin — tears down the old widget tree.
-        // unrealize cascades to all GLAreas in the subtree.
-        while let Some(child) = self.bin.first_child() {
-            self.bin.remove(&child);
+        // A teardown still waiting for its frame rebuilds from the latest tree.
+        if self.teardown_pending.get() {
+            return;
         }
+        let Some(old) = self.bin.first_child() else {
+            self.schedule_rebuild();
+            return;
+        };
 
-        // Rebuild on the next idle tick. The tick separation between
-        // unrealize (above) and realize (rebuild) is critical.
-        self.schedule_rebuild();
+        // Clearing the bin tears down the old widget tree: unrealize cascades
+        // to all GLAreas in the subtree.
+        self.teardown_pending.set(true);
+        let bin = self.bin.clone();
+        let container = Rc::downgrade(self);
+        crate::terminal::detach_after_repaint(&old.clone(), move || {
+            bin.remove(&old);
+            // A lone or zoomed pane is the old root itself; the rebuild reuses it.
+            old.set_visible(true);
+            if let Some(container) = container.upgrade() {
+                container.teardown_pending.set(false);
+                // Rebuild on the next idle tick. The tick separation between
+                // unrealize (above) and realize (rebuild) is critical.
+                container.schedule_rebuild();
+            }
+        });
     }
 
     /// Schedule the actual rebuild on the next idle tick.
@@ -352,9 +443,19 @@ impl SplitTreeContainer {
             return;
         }
         let container = Rc::clone(self);
-        let source = glib::idle_add_local_once(move || {
+        // Ahead of control requests: until the rebuild, the bin holds no pane
+        // for them to find.
+        let source = glib::idle_add_local_full(glib::Priority::HIGH, move || {
             container.rebuild_source.replace(None);
             container.do_rebuild();
+            // Unless it had to queue another pass.
+            if container.rebuild_source.borrow().is_none() {
+                let waiting = container.after_rebuild.take();
+                for f in waiting {
+                    f();
+                }
+            }
+            glib::ControlFlow::Break
         });
         self.rebuild_source.replace(Some(source));
     }
@@ -387,20 +488,32 @@ impl SplitTreeContainer {
         // Newly created panes are tracked as pane containers rather than the
         // inner terminal/browser widget, so restore through the pane helper
         // when possible and fall back to plain widget focus otherwise.
-        if let Some(focused) = self.last_focused.borrow().as_ref() {
-            if !pane::focus_active_tab_in_pane(focused) {
+        let focused = self
+            .last_focused
+            .borrow()
+            .as_ref()
+            .and_then(|w| w.upgrade());
+        if let Some(focused) = focused {
+            if !pane::focus_active_tab_in_pane(&focused) {
                 focused.grab_focus();
             }
         }
+        crate::window::apply_top_bar_mode(&self.state);
     }
 
     fn save_focus(&self) {
+        // A teardown under way unset the focus on purpose (see
+        // `terminal::unset_focus_within`): the focus saved before it still
+        // stands.
+        if self.teardown_pending.get() || self.rebuild_source.borrow().is_some() {
+            return;
+        }
         let focus = self
             .bin
             .root()
             .and_then(|r| r.downcast::<gtk::Window>().ok())
             .and_then(|w| gtk::prelude::GtkWindowExt::focus(&w));
-        *self.last_focused.borrow_mut() = focus;
+        *self.last_focused.borrow_mut() = focus.map(|focus| focus.downgrade());
     }
 }
 
@@ -485,9 +598,14 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
                 .orientation(*orientation)
                 .hexpand(true)
                 .vexpand(true)
+                // Allow either child to be shrunk below its minimum size so
+                // the saved split ratio (e.g. 50/50) is honored even when one
+                // pane has wider tabs than the other. Without this, gtk::Paned
+                // clamps the position to respect the larger pane's minimum
+                // width, producing visibly uneven splits.
+                .shrink_start_child(true)
+                .shrink_end_child(true)
                 .build();
-            paned.set_shrink_start_child(false);
-            paned.set_shrink_end_child(false);
             paned.set_resize_start_child(true);
             paned.set_resize_end_child(true);
 
@@ -495,43 +613,114 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
             update_split_ratio_state(&paned, ratio_val);
             attach_split_position_persistence(state, &paned);
 
-            // Flag to suppress position_notify during programmatic set_position calls
-            // (initial layout and workspace re-map). Without this, set_position triggers
-            // position_notify which recalculates the ratio from the not-yet-stable pixel
-            // position, corrupting the stored ratio.
-            let applying = Rc::new(Cell::new(false));
-
-            // Wire resize drags back to the shared ratio cell in the data model.
-            let shared_ratio = ratio.clone();
-            let applying_for_notify = applying.clone();
-            paned.connect_position_notify(move |paned| {
-                if applying_for_notify.get() {
-                    return;
-                }
-                let allocation = paned.allocation();
-                let size = if paned.orientation() == gtk::Orientation::Horizontal {
-                    allocation.width()
-                } else {
-                    allocation.height()
-                };
-                let new_ratio = layout_state::snapshot_split_ratio(
-                    paned.position(),
-                    size,
-                    Some(*shared_ratio.borrow()),
-                );
-                *shared_ratio.borrow_mut() = layout_state::clamp_split_ratio(new_ratio);
-            });
+            install_split_ratio_tracking(&paned, ratio);
 
             let left_widget = build_widget_tree(left, state);
             let right_widget = build_widget_tree(right, state);
             paned.set_start_child(Some(&left_widget));
             paned.set_end_child(Some(&right_widget));
 
-            apply_split_ratio_after_layout(&paned, *orientation, ratio.clone(), applying);
-
             paned.upcast()
         }
     }
+}
+
+fn install_split_ratio_tracking(paned: &gtk::Paned, ratio: &Rc<RefCell<f64>>) {
+    // Flag to suppress position_notify during programmatic set_position calls
+    // (initial layout and workspace re-map). Without this, set_position triggers
+    // position_notify which recalculates the ratio from the not-yet-stable pixel
+    // position, corrupting the stored ratio.
+    let applying = Rc::new(Cell::new(false));
+
+    // Track the width we last saw, so position_notify can distinguish
+    // user drags (width unchanged → recompute ratio) from width-driven
+    // auto-adjust (width changed → preserve ratio by re-applying
+    // position = ratio * new_width). Without this, opening the
+    // sidebar (which shrinks the inner paned's width) silently skews
+    // the saved ratio because GtkPaned's position is absolute pixels.
+    let last_size = Rc::new(Cell::new(0i32));
+    let shared_ratio = ratio.clone();
+    let applying_for_notify = applying.clone();
+    let last_size_for_notify = last_size.clone();
+    paned.connect_position_notify(move |paned| {
+        if applying_for_notify.get() {
+            return;
+        }
+        let size = if paned.orientation() == gtk::Orientation::Horizontal {
+            paned.width()
+        } else {
+            paned.height()
+        };
+        if size <= 0 {
+            return;
+        }
+        if last_size_for_notify.get() != size {
+            // Width changed — this position-notify is an auto-adjust,
+            // not a user drag. Don't update the ratio, and leave
+            // `last_size` for the tick callback to update after it
+            // re-applies the ratio; otherwise consuming the size change
+            // here would suppress the tick's re-apply and drift the split.
+            return;
+        }
+        // A drag past a child's minimum would let GTK clip that pane.
+        let clamped = clamp_paned_position(paned, paned.position());
+        if clamped != paned.position() {
+            applying_for_notify.set(true);
+            paned.set_position(clamped);
+            applying_for_notify.set(false);
+        }
+        let new_ratio = layout_state::snapshot_split_ratio(
+            paned.position(),
+            size,
+            Some(*shared_ratio.borrow()),
+        );
+        *shared_ratio.borrow_mut() = layout_state::clamp_split_ratio(new_ratio);
+    });
+
+    // Re-apply position = ratio * size whenever the paned's actual
+    // size changes (sidebar toggles, window resizes). GtkWidget's
+    // `width`/`height` properties don't reliably emit notify across
+    // GTK 4.x versions, so we poll via a per-frame tick callback
+    // (intentional: O(1) integer comparison per frame; always returns
+    // Continue so the paned stays reactive for its entire lifetime).
+    let shared_ratio_for_resize = ratio.clone();
+    let applying_for_resize = applying.clone();
+    let last_size_for_resize = last_size.clone();
+    let resize_orientation = paned.orientation();
+    paned.add_tick_callback(move |paned, _| {
+        let size = if resize_orientation == gtk::Orientation::Horizontal {
+            paned.width()
+        } else {
+            paned.height()
+        };
+        if size <= 0 {
+            return glib::ControlFlow::Continue;
+        }
+        if last_size_for_resize.get() != size {
+            // Debug-only jitter probe: each line is one ratio re-apply.
+            // Rapid repeated lines on a stable layout signal the size is
+            // oscillating (worth watching as split trees get deep). Costs
+            // nothing in release builds.
+            #[cfg(debug_assertions)]
+            {
+                let previous = last_size_for_resize.get();
+                eprintln!(
+                    "limux: split-ratio tick reapply ({resize_orientation:?}) size {previous} -> {size}"
+                );
+            }
+            last_size_for_resize.set(size);
+            let ratio = *shared_ratio_for_resize.borrow();
+            crate::window::apply_ratio_value(
+                paned,
+                resize_orientation,
+                ratio,
+                &applying_for_resize,
+            );
+        }
+        glib::ControlFlow::Continue
+    });
+
+    apply_split_ratio_after_layout(paned, paned.orientation(), ratio.clone(), applying);
 }
 
 fn pane_has_room_to_split(target: &gtk::Widget, orientation: gtk::Orientation) -> bool {
@@ -550,6 +739,54 @@ fn minimum_split_extent(orientation: gtk::Orientation) -> i32 {
     } else {
         pane::MIN_PANE_HEIGHT
     }
+}
+
+/// Clamps `position` so neither child of `paned` drops below its minimum
+/// extent (see `layout_state::clamp_split_position`).
+pub(crate) fn clamp_paned_position(paned: &gtk::Paned, position: i32) -> i32 {
+    let orientation = paned.orientation();
+    let child_min = |child: Option<gtk::Widget>| {
+        child.map_or(0, |child| subtree_min_extent(&child, orientation))
+    };
+    layout_state::clamp_split_position(
+        position,
+        child_min(paned.start_child()),
+        child_min(paned.end_child()),
+        paned.max_position(),
+    )
+}
+
+/// Minimum extent of a split subtree along `orientation`: leaves contribute
+/// the pane minimum, nested splits sum them (same orientation) or take the
+/// larger (cross orientation).
+fn subtree_min_extent(widget: &gtk::Widget, orientation: gtk::Orientation) -> i32 {
+    if !widget.is_visible() {
+        return 0;
+    }
+    let Some(paned) = widget.downcast_ref::<gtk::Paned>() else {
+        // The pane minimum, not the measured one: the tab strip does not
+        // scroll, so the measured width grows with every tab and would skew
+        // even splits (the reason the paned children shrink).
+        return minimum_split_extent(orientation);
+    };
+    let start = paned
+        .start_child()
+        .map_or(0, |child| subtree_min_extent(&child, orientation));
+    let end = paned
+        .end_child()
+        .map_or(0, |child| subtree_min_extent(&child, orientation));
+    let along = paned.orientation() == orientation;
+    let handle = if along {
+        // Both children of Limux splits are shrinkable, so GTK's minimum
+        // extent along the Paned's axis is the separator size. Measure it
+        // directly: extent - max_position undercounts when the current
+        // allocation is smaller than the handle (GTK clamps that allocation
+        // to one pixel).
+        paned.measure(orientation, -1).0
+    } else {
+        0
+    };
+    layout_state::nested_split_min_extent(start, end, along, handle)
 }
 
 fn split_extent_has_room(size: i32, orientation: gtk::Orientation) -> bool {
@@ -585,6 +822,7 @@ pub(crate) fn build_split_node_from_layout(
     shortcuts: &Rc<crate::shortcut_config::ResolvedShortcutConfig>,
     ws_id: &str,
     working_directory: Option<&str>,
+    autostart_command: &Rc<RefCell<Option<String>>>,
     layout: &LayoutNodeState,
 ) -> SplitNode {
     match layout {
@@ -594,8 +832,13 @@ pub(crate) fn build_split_node_from_layout(
                 shortcuts,
                 ws_id,
                 working_directory,
-                Some(pane_state),
-                false,
+                autostart_command.clone(),
+                crate::window::PaneCreationOptions {
+                    initial_state: Some(pane_state),
+                    skip_default_tab: false,
+                    suppress_initial_autostart: false,
+                    initial_command: None,
+                },
             );
             SplitNode::Leaf {
                 pane_widget: pane.upcast(),
@@ -616,6 +859,7 @@ pub(crate) fn build_split_node_from_layout(
                     shortcuts,
                     ws_id,
                     working_directory,
+                    autostart_command,
                     &split_state.start,
                 )),
                 right: Box::new(build_split_node_from_layout(
@@ -623,6 +867,7 @@ pub(crate) fn build_split_node_from_layout(
                     shortcuts,
                     ws_id,
                     working_directory,
+                    autostart_command,
                     &split_state.end,
                 )),
             }
@@ -633,6 +878,152 @@ pub(crate) fn build_split_node_from_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn split_ratio_callbacks_release_unmapped_paned() {
+        gtk::init().expect("initialize GTK");
+        for orientation in [gtk::Orientation::Horizontal, gtk::Orientation::Vertical] {
+            let paned = gtk::Paned::new(orientation);
+            let weak = paned.downgrade();
+            install_split_ratio_tracking(&paned, &Rc::new(RefCell::new(0.5)));
+            drop(paned);
+            assert!(
+                weak.upgrade().is_none(),
+                "callbacks retained the split widget"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn restoring_split_respects_nested_pane_minimums() {
+        fn wait_for(condition: impl Fn() -> bool, failure: &str) {
+            let context = glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !condition() {
+                assert!(std::time::Instant::now() < deadline, "{failure}");
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        gtk::init().expect("initialize GTK");
+
+        let make_pane = || {
+            let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            pane.set_size_request(-1, pane::MIN_PANE_HEIGHT);
+            pane
+        };
+        let nested_start = make_pane();
+        let nested_end = make_pane();
+        let nested = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .shrink_start_child(true)
+            .shrink_end_child(true)
+            .build();
+        nested.set_start_child(Some(&nested_start));
+        nested.set_end_child(Some(&nested_end));
+
+        let outer_end = make_pane();
+        let restored = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .shrink_start_child(true)
+            .shrink_end_child(true)
+            .build();
+        restored.set_start_child(Some(&nested));
+        restored.set_end_child(Some(&outer_end));
+        // Begin with the nested Paned below its handle size, as a tiny saved
+        // parent ratio can leave it before the restored ratios are applied.
+        restored.set_position(1);
+
+        let window = gtk::Window::new();
+        window.set_default_size(800, 700);
+        window.set_child(Some(&restored));
+        window.present();
+
+        wait_for(
+            || {
+                restored.is_mapped()
+                    && restored.height() > 0
+                    && nested.is_mapped()
+                    && nested.height() > 0
+            },
+            "split fixture did not receive a GTK allocation",
+        );
+
+        let handle_size = nested.measure(gtk::Orientation::Vertical, -1).0;
+        assert!(
+            handle_size > 0,
+            "GTK separator should have a measurable size"
+        );
+        assert!(
+            nested.height() <= handle_size,
+            "fixture should start with a nested Paned shorter than its handle"
+        );
+        let nested_minimum = pane::MIN_PANE_HEIGHT * 2 + handle_size;
+        let applying = Rc::new(Cell::new(false));
+        assert!(crate::window::apply_ratio_value(
+            &restored,
+            gtk::Orientation::Vertical,
+            0.1085,
+            &applying,
+        ));
+        assert!(
+            restored.position() >= nested_minimum,
+            "restoring a low ratio allocated {} px to a nested split with a {nested_minimum} px minimum",
+            restored.position()
+        );
+        assert!(
+            restored.max_position() - restored.position() >= pane::MIN_PANE_HEIGHT,
+            "restoring a low ratio left the outer end pane below its minimum"
+        );
+
+        wait_for(
+            || nested.height() == restored.position(),
+            "restored split position was not allocated to its nested child",
+        );
+
+        assert!(crate::window::apply_ratio_value(
+            &nested,
+            gtk::Orientation::Vertical,
+            0.1085,
+            &applying,
+        ));
+        assert!(
+            nested.position() >= pane::MIN_PANE_HEIGHT,
+            "restoring a low ratio left the nested start pane at {} px",
+            nested.position()
+        );
+        assert!(
+            nested.max_position() - nested.position() >= pane::MIN_PANE_HEIGHT,
+            "restoring a low ratio left the nested end pane below its minimum"
+        );
+
+        wait_for(
+            || {
+                nested_start.height() == nested.position()
+                    && nested_start.allocation().y() == 0
+                    && nested_end.height() >= pane::MIN_PANE_HEIGHT
+                    && nested_end.allocation().y() + nested_end.height() <= nested.height()
+                    && outer_end.height() >= pane::MIN_PANE_HEIGHT
+                    && outer_end.allocation().y() + outer_end.height() <= restored.height()
+            },
+            "restored split children did not fit their allocated bounds",
+        );
+        assert_eq!(
+            nested_start.allocation().y(),
+            0,
+            "restoring the inner split shifted its start pane out of view"
+        );
+        assert!(nested_start.height() >= pane::MIN_PANE_HEIGHT);
+        assert!(nested_end.height() >= pane::MIN_PANE_HEIGHT);
+        assert!(outer_end.height() >= pane::MIN_PANE_HEIGHT);
+
+        window.close();
+    }
 
     #[test]
     fn split_extent_requires_room_for_both_children() {

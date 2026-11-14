@@ -91,6 +91,12 @@ rg -n "PaneCallbacks \{"                           rust/limux-host-linux/src/win
   compose sequences, `filter_key_event` in `ime.rs` bypasses the
   multicontext entirely. Preserve that bypass when touching keyboard
   routing.
+- **A popover opened on hover must not be autohide.** An autohide
+  popover takes a GTK grab, and the next click is spent dismissing it
+  instead of reaching what it hit — every context-menu item below an
+  open submenu then needs two clicks. Both hover-opened popovers in
+  `terminal.rs` (`build_submenu_button`, the OSC 8 link preview) call
+  `set_autohide(false)` and are closed explicitly; keep it that way.
 - **Clippy is a hard gate** (`-D warnings`). Fix lints, don't suppress.
 - **Don't commit** `target/` or other build artifacts.
 

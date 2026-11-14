@@ -1,19 +1,35 @@
 mod app_config;
+mod browser_link;
 mod control_bridge;
 mod ghostty_config;
+mod gui_hooks;
 mod ime;
+mod input_seats;
 mod keybind_editor;
 mod layout_state;
+mod link_uri;
 mod pane;
+mod session_store;
 mod settings_editor;
 mod shortcut_config;
 mod split_tree;
+mod ssh_dialog;
+mod ssh_helpers;
+mod ssh_hosts;
+mod ssh_session;
+mod ssh_transfer;
+mod tab_activity;
 mod terminal;
 mod window;
+mod workspace_color;
+mod workspace_group;
+mod x11_cursor_errors;
 
 use adw::prelude::*;
 use libadwaita as adw;
+use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 pub(crate) const APP_ID: &str = "dev.limux.linux";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -150,6 +166,16 @@ pub(crate) fn terminal_child_environment_overrides() -> Vec<(String, String)> {
             "LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH",
             "LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH_SET",
         ),
+        (
+            "GBM_BACKENDS_PATH",
+            "LIMUX_ORIGINAL_GBM_BACKENDS_PATH",
+            "LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET",
+        ),
+        (
+            "LIBGL_DRIVERS_PATH",
+            "LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH",
+            "LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET",
+        ),
     ];
 
     RESTORE_VARS
@@ -180,14 +206,9 @@ fn gtk_runtime_at_least(major: u32, minor: u32, micro: u32) -> bool {
     gtk_runtime_version() >= (major, minor, micro)
 }
 
-fn main() {
+/// Configure the embedded renderer before GTK initializes, including in tests.
+fn prepare_ghostty_runtime() {
     limux_ghostty_sys::ensure_glad_symbols_linked();
-
-    // Handle --version flag
-    if std::env::args().any(|a| a == "--version" || a == "-v") {
-        println!("Limux {VERSION}");
-        return;
-    }
 
     // Ghostty requires desktop OpenGL, not GLES. Must set the GTK renderer
     // environment before GTK initializes, and the exact knobs differ by GTK
@@ -205,6 +226,16 @@ fn main() {
     // terminfo, and shell integration. Prefer Limux-bundled resources but
     // fall back to common system Ghostty install locations.
     set_ghostty_runtime_env();
+}
+
+fn main() {
+    // Handle --version flag
+    if std::env::args().any(|a| a == "--version" || a == "-v") {
+        println!("Limux {VERSION}");
+        return;
+    }
+
+    prepare_ghostty_runtime();
     sanitize_terminal_child_env();
 
     // WebKitGTK's bubblewrap sandbox requires unprivileged user namespaces,
@@ -221,7 +252,14 @@ fn main() {
         .flags(adw::gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
+    let input_seat_bridge = Rc::new(OnceCell::new());
+    let input_seat_bridge_for_activate = Rc::clone(&input_seat_bridge);
     app.connect_activate(move |app| {
+        if input_seat_bridge_for_activate.get().is_none() {
+            let bridge = gtk4::gdk::Display::default()
+                .and_then(|display| input_seats::InputSeatRemovalBridge::install(&display));
+            let _ = input_seat_bridge_for_activate.set(bridge);
+        }
         window::build_window(app);
     });
     app.run();
@@ -344,6 +382,12 @@ mod tests {
             "WEBKIT_INJECTED_BUNDLE_PATH",
             "LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH",
             "LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH_SET",
+            "GBM_BACKENDS_PATH",
+            "LIMUX_ORIGINAL_GBM_BACKENDS_PATH",
+            "LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET",
+            "LIBGL_DRIVERS_PATH",
+            "LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH",
+            "LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET",
         ]);
 
         std::env::set_var("LD_LIBRARY_PATH", "/tmp/.mount_Limux/usr/lib");
@@ -364,6 +408,12 @@ mod tests {
         );
         std::env::set_var("LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH", "");
         std::env::set_var("LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH_SET", "0");
+        std::env::set_var("GBM_BACKENDS_PATH", "/usr/lib/gbm");
+        std::env::set_var("LIMUX_ORIGINAL_GBM_BACKENDS_PATH", "");
+        std::env::set_var("LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET", "0");
+        std::env::set_var("LIBGL_DRIVERS_PATH", "/usr/lib/dri");
+        std::env::set_var("LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH", "/host/dri");
+        std::env::set_var("LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET", "1");
 
         let overrides = terminal_child_environment_overrides();
 
@@ -371,6 +421,8 @@ mod tests {
         assert!(overrides.contains(&("GDK_PIXBUF_MODULE_FILE".to_string(), String::new())));
         assert!(overrides.contains(&("WEBKIT_EXEC_PATH".to_string(), "/host/webkit".to_string())));
         assert!(overrides.contains(&("WEBKIT_INJECTED_BUNDLE_PATH".to_string(), String::new())));
+        assert!(overrides.contains(&("GBM_BACKENDS_PATH".to_string(), String::new())));
+        assert!(overrides.contains(&("LIBGL_DRIVERS_PATH".to_string(), "/host/dri".to_string())));
     }
 
     #[test]

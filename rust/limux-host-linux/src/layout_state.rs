@@ -1,9 +1,12 @@
 use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+
+use crate::workspace_color::WorkspaceColor;
 
 pub const SESSION_VERSION: u32 = 1;
 pub const PERSISTENCE_DIR_NAME: &str = "limux";
@@ -47,6 +50,8 @@ pub struct AppSessionState {
     pub sidebar: SidebarState,
     #[serde(default)]
     pub workspaces: Vec<WorkspaceState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<WorkspaceGroupState>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -60,7 +65,36 @@ pub struct WorkspaceState {
     pub cwd: Option<String>,
     #[serde(default)]
     pub folder_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autostart_command: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::workspace_color::deserialize_option"
+    )]
+    pub color: Option<WorkspaceColor>,
+    /// The sidebar group this workspace belongs to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     pub layout: LayoutNodeState,
+}
+
+/// A sidebar workspace group. Members name it through `WorkspaceState::group_id`;
+/// `position` is its top-level sidebar index, which only places an empty group.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct WorkspaceGroupState {
+    pub id: String,
+    pub name: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::workspace_color::deserialize_option"
+    )]
+    pub color: Option<WorkspaceColor>,
+    #[serde(default)]
+    pub collapsed: bool,
+    #[serde(default)]
+    pub position: usize,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -191,6 +225,8 @@ pub enum TabContentState {
         cwd: Option<String>,
         #[serde(default)]
         agent: Option<RestorableAgentState>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh: Option<Box<crate::ssh_session::SshConnection>>,
     },
     Browser {
         #[serde(default)]
@@ -227,13 +263,22 @@ impl Default for AppSessionState {
             top_bar_visible: default_top_bar_visible(),
             sidebar: SidebarState::default(),
             workspaces: Vec::new(),
+            groups: Vec::new(),
         }
     }
 }
 
 impl PaneState {
+    pub fn ssh(connection: crate::ssh_session::SshConnection) -> Self {
+        let mut pane = Self::fallback(None);
+        if let TabContentState::Terminal { ssh, .. } = &mut pane.tabs[0].content {
+            *ssh = Some(Box::new(connection));
+        }
+        pane
+    }
+
     pub fn fallback(working_directory: Option<&str>) -> Self {
-        let tab = TabState::terminal(default_tab_id("terminal"), working_directory);
+        let tab = TabState::terminal(new_tab_id(), working_directory);
         Self {
             pane_id: None,
             active_tab_id: Some(tab.id.clone()),
@@ -242,7 +287,7 @@ impl PaneState {
     }
 
     pub fn browser_only(uri: Option<&str>) -> Self {
-        let tab = TabState::browser(default_tab_id("browser"), uri);
+        let tab = TabState::browser(new_tab_id(), uri);
         Self {
             pane_id: None,
             active_tab_id: Some(tab.id.clone()),
@@ -260,6 +305,7 @@ impl TabState {
             content: TabContentState::Terminal {
                 cwd: cwd.map(|value| value.to_string()),
                 agent: None,
+                ssh: None,
             },
         }
     }
@@ -330,21 +376,32 @@ pub fn load_session_from_dir(dir: &Path) -> LoadedSession {
     }
 }
 
-pub fn save_session_atomic(state: &AppSessionState) -> io::Result<PathBuf> {
-    save_session_atomic_in(&persistence_dir(), state)
-}
-
 pub fn save_session_atomic_in(dir: &Path, state: &AppSessionState) -> io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let path = canonical_session_path_in(dir);
+    save_session_atomic_to(&path, state)
+}
+
+pub(crate) fn save_session_atomic_to(path: &Path, state: &AppSessionState) -> io::Result<PathBuf> {
     // Write to a sibling temp file first so a crash never leaves a truncated canonical session.
-    let temp_path = temp_session_path(&path);
+    let temp_path = temp_session_path(path);
     let normalized = normalize_session(state.clone());
     let json = serde_json::to_vec_pretty(&normalized)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    fs::write(&temp_path, json)?;
-    fs::rename(&temp_path, &path)?;
-    Ok(path)
+    match fs::remove_file(&temp_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let mut temp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp_path)?;
+    temp_file.write_all(&json)?;
+    drop(temp_file);
+    fs::rename(&temp_path, path)?;
+    Ok(path.to_path_buf())
 }
 
 pub fn clamp_split_ratio(ratio: f64) -> f64 {
@@ -375,6 +432,27 @@ pub fn split_position_from_ratio(ratio: f64, total_size: i32) -> i32 {
         return 0;
     }
     (clamp_split_ratio(ratio) * total_size as f64).round() as i32
+}
+
+/// Keeps both children of a split at or above their minimum extent, so GTK
+/// never has to shift a shrunk child out of view (it allocates the minimum
+/// and clips the side away from the handle, hiding a pane's tab bar). Left
+/// unchanged when the split is too small to fit both minimums.
+pub fn clamp_split_position(position: i32, start_min: i32, end_min: i32, max_position: i32) -> i32 {
+    if start_min + end_min > max_position {
+        return position;
+    }
+    position.clamp(start_min, max_position - end_min)
+}
+
+/// Minimum extent of a nested split from its children's minimums: stacked
+/// along the split's own orientation (plus the handle), side by side across.
+pub fn nested_split_min_extent(start_min: i32, end_min: i32, along: bool, handle: i32) -> i32 {
+    if along {
+        start_min + end_min + handle
+    } else {
+        start_min.max(end_min)
+    }
 }
 
 pub fn normalize_session(mut state: AppSessionState) -> AppSessionState {
@@ -432,13 +510,16 @@ impl AppSessionState {
                     .folder_path
                     .as_deref()
                     .or(workspace.cwd.as_deref());
-                let tab = TabState::terminal(default_tab_id("legacy-terminal"), working_directory);
+                let tab = TabState::terminal(new_tab_id(), working_directory);
                 WorkspaceState {
                     id: None,
                     name: workspace.name,
                     favorite: workspace.favorite,
                     cwd: workspace.cwd,
                     folder_path: workspace.folder_path,
+                    autostart_command: None,
+                    color: None,
+                    group_id: None,
                     // Legacy files only knew "workspace exists"; rehydrate a fresh terminal at the
                     // last known directory instead of pretending process state can be restored.
                     layout: LayoutNodeState::Pane(PaneState {
@@ -472,6 +553,14 @@ struct HookSessionRecord {
 struct HookSessionFile {
     #[serde(default)]
     sessions: BTreeMap<String, HookSessionRecord>,
+    #[serde(default)]
+    ended_sessions: Vec<EndedHookSession>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct EndedHookSession {
+    session_id: String,
+    surface_id: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -479,6 +568,7 @@ pub struct RestorableAgentIndex {
     by_surface: HashMap<(String, String), (RestorableAgentState, f64)>,
     by_any_workspace_surface: HashMap<String, Option<(RestorableAgentState, f64)>>,
     by_tab_id: HashMap<String, Option<(RestorableAgentState, f64)>>,
+    ended_sessions: Vec<(RestorableAgentKind, EndedHookSession)>,
 }
 
 impl RestorableAgentIndex {
@@ -501,6 +591,9 @@ impl RestorableAgentIndex {
             let Ok(file) = serde_json::from_str::<HookSessionFile>(&raw) else {
                 continue;
             };
+            index
+                .ended_sessions
+                .extend(file.ended_sessions.into_iter().map(|record| (kind, record)));
             for record in file.sessions.values() {
                 let Some(session_id) = normalized_str(&record.session_id) else {
                     continue;
@@ -511,6 +604,9 @@ impl RestorableAgentIndex {
                 let Some(surface_id) = normalized_str(&record.surface_id) else {
                     continue;
                 };
+                if index.session_ended(kind, &session_id, surface_tab_id(&surface_id)) {
+                    continue;
+                }
                 let tab_id = surface_id
                     .rsplit_once(':')
                     .map(|(_, tab_id)| tab_id.to_string());
@@ -601,6 +697,31 @@ impl RestorableAgentIndex {
             })
             .map(|(agent, _)| agent.clone())
     }
+
+    fn session_ended(&self, kind: RestorableAgentKind, session_id: &str, tab_id: &str) -> bool {
+        self.ended_sessions.iter().any(|(ended_kind, ended)| {
+            *ended_kind == kind
+                && ended.session_id.trim() == session_id.trim()
+                && surface_tab_id(ended.surface_id.trim()) == tab_id
+        })
+    }
+}
+
+fn surface_tab_id(surface_id: &str) -> &str {
+    surface_id.rsplit(':').next().unwrap_or(surface_id)
+}
+
+pub(crate) fn attach_restorable_agents_to_session(
+    session: &mut AppSessionState,
+    index: &RestorableAgentIndex,
+) {
+    for workspace in &mut session.workspaces {
+        attach_restorable_agents_to_layout(
+            &mut workspace.layout,
+            workspace.id.as_deref().unwrap_or(""),
+            index,
+        );
+    }
 }
 
 pub fn attach_restorable_agents_to_layout(
@@ -612,6 +733,11 @@ pub fn attach_restorable_agents_to_layout(
         LayoutNodeState::Pane(pane) => {
             for tab in &mut pane.tabs {
                 if let TabContentState::Terminal { agent, .. } = &mut tab.content {
+                    if agent.as_ref().is_some_and(|agent| {
+                        index.session_ended(agent.kind, &agent.session_id, &tab.id)
+                    }) {
+                        *agent = None;
+                    }
                     if agent
                         .as_ref()
                         .is_some_and(|agent| !agent.restore_on_startup)
@@ -677,8 +803,53 @@ fn default_split_ratio() -> f64 {
     DEFAULT_SPLIT_RATIO
 }
 
-fn default_tab_id(prefix: &str) -> String {
-    format!("{prefix}-0")
+/// Tab ids must be unique across the whole session: a tab can move between panes and
+/// workspaces, and panes look tabs up by id (issue #201).
+pub(crate) fn new_tab_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Give a fresh id to every tab whose id already appeared earlier in the session, keeping
+/// the pane's active tab. Sessions saved before tab ids were unique start every workspace
+/// at "terminal-0". Returns whether any id changed.
+pub(crate) fn dedup_tab_ids(state: &mut AppSessionState) -> bool {
+    fn dedup(layout: &mut LayoutNodeState, seen: &mut std::collections::HashSet<String>) -> bool {
+        match layout {
+            LayoutNodeState::Pane(pane) => {
+                let mut changed = false;
+                let mut active_kept = false;
+                let mut active_renamed_to = None;
+                for tab in &mut pane.tabs {
+                    let active = pane.active_tab_id.as_deref() == Some(tab.id.as_str());
+                    if seen.insert(tab.id.clone()) {
+                        active_kept |= active;
+                        continue;
+                    }
+                    let id = new_tab_id();
+                    seen.insert(id.clone());
+                    if active && active_renamed_to.is_none() {
+                        active_renamed_to = Some(id.clone());
+                    }
+                    tab.id = id;
+                    changed = true;
+                }
+                if let Some(renamed) = active_renamed_to.filter(|_| !active_kept) {
+                    pane.active_tab_id = Some(renamed);
+                }
+                changed
+            }
+            LayoutNodeState::Split(split) => {
+                let start = dedup(&mut split.start, seen);
+                dedup(&mut split.end, seen) || start
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut changed = false;
+    for workspace in &mut state.workspaces {
+        changed |= dedup(&mut workspace.layout, &mut seen);
+    }
+    changed
 }
 
 fn build_resume_command(
@@ -758,6 +929,9 @@ fn wrap_restored_agent_command(
 }
 
 fn limux_cli_executable() -> String {
+    if let Some(path) = limux_control::flatpak::host_cli_executable() {
+        return path.to_string_lossy().into_owned();
+    }
     std::env::current_exe()
         .ok()
         .and_then(|path| {
@@ -903,6 +1077,8 @@ fn shell_single_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
     use tempfile::tempdir;
 
@@ -982,6 +1158,9 @@ mod tests {
                 favorite: true,
                 cwd: Some("/canonical".to_string()),
                 folder_path: Some("/canonical".to_string()),
+                autostart_command: None,
+                color: None,
+                group_id: None,
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/canonical"))),
             }],
             ..AppSessionState::default()
@@ -1076,6 +1255,12 @@ mod tests {
     #[test]
     fn save_session_atomic_writes_canonical_file() {
         let dir = tempdir().expect("tempdir");
+        let canonical_path = canonical_session_path_in(dir.path());
+        let temp_path = temp_session_path(&canonical_path);
+        fs::write(&temp_path, "stale session").expect("write stale session");
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o644))
+            .expect("set stale session permissions");
+        let mut stale_reader = fs::File::open(&temp_path).expect("open stale session");
         let state = AppSessionState {
             workspaces: vec![WorkspaceState {
                 id: Some("22222222-2222-4222-8222-222222222222".to_string()),
@@ -1083,13 +1268,29 @@ mod tests {
                 favorite: false,
                 cwd: Some("/tmp".to_string()),
                 folder_path: Some("/tmp".to_string()),
+                autostart_command: Some("ssh user@server".to_string()),
+                color: None,
+                group_id: None,
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/tmp"))),
             }],
             ..AppSessionState::default()
         };
 
         let path = save_session_atomic_in(dir.path(), &state).expect("save canonical session");
-        assert_eq!(path, canonical_session_path_in(dir.path()));
+        assert_eq!(path, canonical_path);
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("session metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let mut stale_contents = String::new();
+        stale_reader
+            .read_to_string(&mut stale_contents)
+            .expect("read stale session inode");
+        assert_eq!(stale_contents, "stale session");
         let raw = fs::read_to_string(path).expect("read canonical session");
         let decoded: AppSessionState =
             serde_json::from_str(&raw).expect("decode canonical session");
@@ -1099,6 +1300,92 @@ mod tests {
             Some("22222222-2222-4222-8222-222222222222")
         );
         assert_eq!(decoded.workspaces[0].name, "workspace");
+        assert_eq!(
+            decoded.workspaces[0].autostart_command.as_deref(),
+            Some("ssh user@server")
+        );
+    }
+
+    #[test]
+    fn workspace_color_round_trips_and_tolerates_missing_or_unknown_names() {
+        let mut workspace = WorkspaceState {
+            id: None,
+            name: "colored".to_string(),
+            favorite: false,
+            cwd: None,
+            folder_path: None,
+            autostart_command: None,
+            color: Some(WorkspaceColor::Teal),
+            group_id: None,
+            layout: LayoutNodeState::Pane(PaneState::fallback(None)),
+        };
+
+        let mut encoded = serde_json::to_value(&workspace).expect("encode workspace");
+        assert_eq!(encoded["color"], "teal");
+        let decoded: WorkspaceState =
+            serde_json::from_value(encoded.clone()).expect("decode colored workspace");
+        assert_eq!(decoded, workspace);
+
+        // A colour this build does not know must not fail the whole session.
+        encoded["color"] = serde_json::json!("chartreuse");
+        let decoded: WorkspaceState =
+            serde_json::from_value(encoded.clone()).expect("decode unknown color");
+        assert_eq!(decoded.color, None);
+
+        workspace.color = None;
+        let encoded = serde_json::to_value(&workspace).expect("encode plain workspace");
+        assert!(encoded.get("color").is_none());
+        let decoded: WorkspaceState =
+            serde_json::from_value(encoded).expect("decode workspace without color");
+        assert_eq!(decoded.color, None);
+    }
+
+    #[test]
+    fn workspace_groups_round_trip_and_are_optional() {
+        let mut workspace = WorkspaceState {
+            id: Some("ws".to_string()),
+            name: "grouped".to_string(),
+            favorite: false,
+            cwd: None,
+            folder_path: None,
+            autostart_command: None,
+            color: None,
+            group_id: Some("g".to_string()),
+            layout: LayoutNodeState::Pane(PaneState::fallback(None)),
+        };
+        let state = AppSessionState {
+            workspaces: vec![workspace.clone()],
+            groups: vec![WorkspaceGroupState {
+                id: "g".to_string(),
+                name: "Backend".to_string(),
+                color: Some(WorkspaceColor::Blue),
+                collapsed: true,
+                position: 0,
+            }],
+            ..AppSessionState::default()
+        };
+        let encoded = serde_json::to_value(&state).expect("encode grouped session");
+        assert_eq!(encoded["groups"][0]["color"], "blue");
+        assert_eq!(encoded["workspaces"][0]["group_id"], "g");
+        let decoded: AppSessionState =
+            serde_json::from_value(encoded).expect("decode grouped session");
+        assert_eq!(decoded, state);
+
+        // Sessions without groups neither write nor need the fields.
+        workspace.group_id = None;
+        let plain = AppSessionState {
+            workspaces: vec![workspace],
+            ..AppSessionState::default()
+        };
+        let encoded = serde_json::to_value(&plain).expect("encode plain session");
+        assert!(encoded.get("groups").is_none());
+        assert!(encoded["workspaces"][0].get("group_id").is_none());
+
+        // An unknown group colour still loads; the sidebar picks a new one.
+        let raw = r#"{"groups": [{"id": "g", "name": "G", "color": "chartreuse"}]}"#;
+        let decoded: AppSessionState = serde_json::from_str(raw).expect("decode unknown color");
+        assert_eq!(decoded.groups[0].color, None);
+        assert!(!decoded.groups[0].collapsed);
     }
 
     #[test]
@@ -1371,6 +1658,7 @@ mod tests {
                 custom_name: None,
                 pinned: false,
                 content: TabContentState::Terminal {
+                    ssh: None,
                     cwd: Some("/tmp/project".to_string()),
                     agent: Some(RestorableAgentState {
                         kind: RestorableAgentKind::Codex,
@@ -1396,6 +1684,100 @@ mod tests {
                 );
             }
             other => panic!("expected terminal tab, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hook_cleanup_clears_cached_binding_after_pane_and_workspace_move() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            serde_json::json!({
+                "version": 1,
+                "sessions": {},
+                "ended_sessions": [{
+                    "session_id": "ended", "workspace_id": "old-workspace",
+                    "surface_id": "42:tab-a", "updated_at": 20.0
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut tab = TabState::terminal("tab-a", None);
+        let TabContentState::Terminal { agent, .. } = &mut tab.content else {
+            unreachable!()
+        };
+        *agent = Some(RestorableAgentState {
+            kind: RestorableAgentKind::Codex,
+            session_id: "ended".into(),
+            cwd: None,
+            launch_command: None,
+            restore_on_startup: true,
+        });
+        let mut layout = LayoutNodeState::Pane(PaneState {
+            pane_id: Some(99),
+            active_tab_id: Some("tab-a".into()),
+            tabs: vec![tab],
+        });
+        let index = RestorableAgentIndex::load_from_dir(dir.path());
+        attach_restorable_agents_to_layout(&mut layout, "new-workspace", &index);
+        let LayoutNodeState::Pane(pane) = layout else {
+            unreachable!()
+        };
+        let TabContentState::Terminal { agent, .. } = &pane.tabs[0].content else {
+            unreachable!()
+        };
+        assert!(
+            agent.is_none(),
+            "explicit cleanup must prevent the cached agent from resuming again"
+        );
+    }
+
+    #[test]
+    fn hook_cleanup_does_not_clear_another_kind_session_or_tab() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            serde_json::json!({
+                "version": 1, "sessions": {}, "ended_sessions": [{
+                    "session_id": "ended", "workspace_id": "workspace",
+                    "surface_id": "42:tab-a", "updated_at": 20.0
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let index = RestorableAgentIndex::load_from_dir(dir.path());
+        for (kind, session_id, tab_id) in [
+            (RestorableAgentKind::Claude, "ended", "tab-a"),
+            (RestorableAgentKind::Codex, "new-session", "tab-a"),
+            (RestorableAgentKind::Codex, "ended", "tab-b"),
+        ] {
+            let binding = RestorableAgentState {
+                kind,
+                session_id: session_id.into(),
+                cwd: None,
+                launch_command: None,
+                restore_on_startup: true,
+            };
+            let mut tab = TabState::terminal(tab_id, None);
+            let TabContentState::Terminal { agent, .. } = &mut tab.content else {
+                unreachable!()
+            };
+            *agent = Some(binding.clone());
+            let mut layout = LayoutNodeState::Pane(PaneState {
+                pane_id: Some(42),
+                active_tab_id: Some(tab_id.into()),
+                tabs: vec![tab],
+            });
+            attach_restorable_agents_to_layout(&mut layout, "workspace", &index);
+            let LayoutNodeState::Pane(pane) = layout else {
+                unreachable!()
+            };
+            let TabContentState::Terminal { agent, .. } = &pane.tabs[0].content else {
+                unreachable!()
+            };
+            assert_eq!(agent.as_ref(), Some(&binding));
         }
     }
 
@@ -1456,6 +1838,7 @@ mod tests {
             custom_name: None,
             pinned: false,
             content: TabContentState::Terminal {
+                ssh: None,
                 cwd: Some("/tmp/project".to_string()),
                 agent: Some(RestorableAgentState {
                     kind: RestorableAgentKind::Codex,
@@ -1579,11 +1962,56 @@ mod tests {
     }
 
     #[test]
+    fn default_panes_get_unique_tab_ids() {
+        // A workspace's first tab can be moved into another workspace's pane
+        // (issue #201), so default tab ids must not collide across panes.
+        let ids = [
+            PaneState::fallback(None).tabs[0].id.clone(),
+            PaneState::fallback(None).tabs[0].id.clone(),
+            PaneState::browser_only(None).tabs[0].id.clone(),
+            PaneState::browser_only(None).tabs[0].id.clone(),
+        ]
+        .into_iter()
+        .chain(
+            AppSessionState::from_legacy(vec![
+                LegacySavedWorkspace {
+                    name: "a".into(),
+                    favorite: false,
+                    cwd: None,
+                    folder_path: None,
+                },
+                LegacySavedWorkspace {
+                    name: "b".into(),
+                    favorite: false,
+                    cwd: None,
+                    folder_path: None,
+                },
+            ])
+            .workspaces
+            .into_iter()
+            .map(|workspace| match workspace.layout {
+                LayoutNodeState::Pane(pane) => pane.tabs[0].id.clone(),
+                LayoutNodeState::Split(_) => panic!("legacy workspace must be a single pane"),
+            }),
+        )
+        .collect::<Vec<_>>();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "duplicate default tab ids: {ids:?}"
+        );
+    }
+
+    #[test]
     fn browser_only_pane_creates_a_single_browser_tab() {
         let pane = PaneState::browser_only(Some("https://example.com"));
 
         assert_eq!(pane.tabs.len(), 1);
-        assert_eq!(pane.active_tab_id.as_deref(), Some("browser-0"));
+        assert_eq!(
+            pane.active_tab_id.as_deref(),
+            Some(pane.tabs[0].id.as_str())
+        );
         match &pane.tabs[0].content {
             TabContentState::Browser { uri } => {
                 assert_eq!(uri.as_deref(), Some("https://example.com"));
@@ -1602,6 +2030,9 @@ mod tests {
                 favorite: false,
                 cwd: None,
                 folder_path: None,
+                autostart_command: None,
+                color: None,
+                group_id: None,
                 layout: LayoutNodeState::Pane(PaneState {
                     pane_id: None,
                     active_tab_id: Some("keybinds-1".to_string()),
@@ -1633,6 +2064,22 @@ mod tests {
         assert_eq!(split_ratio_from_position(0, 0), DEFAULT_SPLIT_RATIO);
         assert!(split_ratio_from_position(9999, 10) <= MAX_SPLIT_RATIO);
         assert_eq!(split_position_from_ratio(f64::INFINITY, 200), 100);
+    }
+
+    #[test]
+    fn clamp_split_position_keeps_both_children_at_their_minimum() {
+        // Restored 0.1085 ratio on an 869 px split: 94 px < 160 px minimum.
+        assert_eq!(clamp_split_position(94, 160, 160, 868), 160);
+        assert_eq!(clamp_split_position(800, 160, 160, 868), 708);
+        assert_eq!(clamp_split_position(434, 160, 160, 868), 434);
+        // Too small for both minimums: leave the position alone.
+        assert_eq!(clamp_split_position(94, 160, 160, 300), 94);
+    }
+
+    #[test]
+    fn nested_split_min_extent_sums_along_and_maxes_across() {
+        assert_eq!(nested_split_min_extent(160, 320, true, 1), 481);
+        assert_eq!(nested_split_min_extent(160, 320, false, 1), 320);
     }
 
     #[test]

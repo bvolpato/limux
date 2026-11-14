@@ -1,6 +1,14 @@
 name: Build RPM Package
 
 on:
+  pull_request:
+    paths:
+      - .github/workflows/release-rpm.yml
+      - Cargo.lock
+      - Cargo.toml
+      - ghostty
+      - rust/**
+      - scripts/**
   release:
     types: [published]
   workflow_dispatch:
@@ -10,11 +18,13 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   rpm:
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Check out repository
@@ -29,20 +39,39 @@ jobs:
 
       - name: Determine version
         id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.version }}" ]; then
-            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_VERSION" ]; then
+            version="$INPUT_VERSION"
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           else
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            version="${REF_NAME#v}"
           fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid release version: $version"
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Validate release version
-        run: ./scripts/validate-release-version.sh "${{ steps.version.outputs.version }}"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/validate-release-version.sh "$VERSION"
 
       - name: Install stable Rust
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+
+      - name: Install uv for packaged runtime smoke
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.11.15"
 
       - name: Install system dependencies
         run: |
@@ -51,11 +80,15 @@ jobs:
             appstream \
             binutils \
             build-essential \
+            cpio \
+            dbus-x11 \
             desktop-file-utils \
+            fuse3 \
             gettext \
             libadwaita-1-dev \
             libepoxy-dev \
             libgdk-pixbuf2.0-bin \
+            libgl1-mesa-dri \
             libgtk-4-dev \
             librsvg2-common \
             libxml2-utils \
@@ -64,7 +97,8 @@ jobs:
             ninja-build \
             pkg-config \
             python3-gi \
-            rpm
+            rpm \
+            weston
 
       - name: Install current blueprint-compiler
         run: |
@@ -77,17 +111,27 @@ jobs:
       - name: Test AppImage SVG loader packaging
         run: ./scripts/tests/test-package-svg-loader.sh
 
+      - name: Test packaged runtime cleanup
+        run: uv run scripts/tests/test-smoke-cleanup.py
+
       - name: Build RPM package
         env:
           LIMUX_MAX_GLIBC: "2.39"
           LIMUX_REQUIRE_SVG_LOADER: "1"
-        run: ./scripts/package.sh "${{ steps.version.outputs.version }}"
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/package.sh "$VERSION"
+
+      - name: Smoke exact RPM artifact
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/smoke-release-artifacts.sh "$VERSION" rpm
 
       - name: Resolve RPM path
         id: rpm
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"
           ARCH="$(uname -m)"
           RPM_ARCH="x86_64"
           [ "$ARCH" = "aarch64" ] && RPM_ARCH="aarch64"
@@ -96,18 +140,34 @@ jobs:
           echo "rpm_path=$RPM_OUTPUT" >> "$GITHUB_OUTPUT"
           echo "rpm_arch=$RPM_ARCH" >> "$GITHUB_OUTPUT"
 
-      - name: Upload RPM to release
-        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          files: ${{ steps.rpm.outputs.rpm_path }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Upload RPM as artifact
         uses: actions/upload-artifact@v7
         with:
           name: limux-rpm-${{ steps.version.outputs.version }}
           path: ${{ steps.rpm.outputs.rpm_path }}
+          if-no-files-found: error
           retention-days: 30
+
+  publish:
+    name: Upload RPM to release
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    needs: rpm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download RPM package
+        uses: actions/download-artifact@v8
+        with:
+          name: limux-rpm-${{ needs.rpm.outputs.version }}
+          path: dist
+
+      - name: Upload RPM to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.rpm.outputs.version }}
+          files: dist/limux-${{ needs.rpm.outputs.version }}-1.x86_64.rpm
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

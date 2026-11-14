@@ -8,11 +8,11 @@ fn main() {
     let ghostty_lib = ghostty_root
         .join("zig-out/lib")
         .canonicalize()
-        .expect("Ghostty library directory not found — run: cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast");
+        .expect("Ghostty library directory not found; run: ./scripts/build-ghostty.sh");
 
     if !ghostty_lib.join(ghostty_library).is_file() {
         panic!(
-            "{ghostty_library} not found at {} — run: cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast",
+            "{ghostty_library} not found at {}; run: ./scripts/build-ghostty.sh",
             ghostty_lib.display()
         );
     }

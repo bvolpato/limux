@@ -15,6 +15,14 @@ pub type ghostty_app_t = *mut c_void;
 pub type ghostty_config_t = *mut c_void;
 pub type ghostty_surface_t = *mut c_void;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ghostty_string_s {
+    pub ptr: *const c_char,
+    pub len: usize,
+    pub sentinel: bool,
+}
+
 // -------------------------------------------------------------------
 // Enums
 // -------------------------------------------------------------------
@@ -25,7 +33,8 @@ pub const GHOSTTY_PLATFORM_IOS: c_int = 2;
 pub const GHOSTTY_PLATFORM_OPENGL: c_int = 3;
 pub const GHOSTTY_PLATFORM_METAL_EXTERNAL: c_int = 4;
 pub const GHOSTTY_PLATFORM_METAL_EXTERNAL_LEASED: c_int = 5;
-pub const GHOSTTY_PLATFORM_LINUX: c_int = 6;
+pub const GHOSTTY_PLATFORM_OFFSCREEN: c_int = 6;
+pub const GHOSTTY_PLATFORM_LINUX: c_int = 7;
 
 pub const GHOSTTY_CLIPBOARD_STANDARD: c_int = 0;
 pub const GHOSTTY_CLIPBOARD_SELECTION: c_int = 1;
@@ -216,6 +225,47 @@ pub const GHOSTTY_KEY_ARROW_DOWN: c_int = 75;
 pub const GHOSTTY_KEY_ARROW_LEFT: c_int = 76;
 pub const GHOSTTY_KEY_ARROW_RIGHT: c_int = 77;
 pub const GHOSTTY_KEY_ARROW_UP: c_int = 78;
+// Numpad Section
+pub const GHOSTTY_KEY_NUMPAD_0: c_int = 80;
+pub const GHOSTTY_KEY_NUMPAD_1: c_int = 81;
+pub const GHOSTTY_KEY_NUMPAD_2: c_int = 82;
+pub const GHOSTTY_KEY_NUMPAD_3: c_int = 83;
+pub const GHOSTTY_KEY_NUMPAD_4: c_int = 84;
+pub const GHOSTTY_KEY_NUMPAD_5: c_int = 85;
+pub const GHOSTTY_KEY_NUMPAD_6: c_int = 86;
+pub const GHOSTTY_KEY_NUMPAD_7: c_int = 87;
+pub const GHOSTTY_KEY_NUMPAD_8: c_int = 88;
+pub const GHOSTTY_KEY_NUMPAD_9: c_int = 89;
+pub const GHOSTTY_KEY_NUMPAD_ADD: c_int = 90;
+pub const GHOSTTY_KEY_NUMPAD_BACKSPACE: c_int = 91;
+pub const GHOSTTY_KEY_NUMPAD_CLEAR: c_int = 92;
+pub const GHOSTTY_KEY_NUMPAD_CLEAR_ENTRY: c_int = 93;
+pub const GHOSTTY_KEY_NUMPAD_COMMA: c_int = 94;
+pub const GHOSTTY_KEY_NUMPAD_DECIMAL: c_int = 95;
+pub const GHOSTTY_KEY_NUMPAD_DIVIDE: c_int = 96;
+pub const GHOSTTY_KEY_NUMPAD_ENTER: c_int = 97;
+pub const GHOSTTY_KEY_NUMPAD_EQUAL: c_int = 98;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_ADD: c_int = 99;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_CLEAR: c_int = 100;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_RECALL: c_int = 101;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_STORE: c_int = 102;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_SUBTRACT: c_int = 103;
+pub const GHOSTTY_KEY_NUMPAD_MULTIPLY: c_int = 104;
+pub const GHOSTTY_KEY_NUMPAD_PAREN_LEFT: c_int = 105;
+pub const GHOSTTY_KEY_NUMPAD_PAREN_RIGHT: c_int = 106;
+pub const GHOSTTY_KEY_NUMPAD_SUBTRACT: c_int = 107;
+pub const GHOSTTY_KEY_NUMPAD_SEPARATOR: c_int = 108;
+pub const GHOSTTY_KEY_NUMPAD_UP: c_int = 109;
+pub const GHOSTTY_KEY_NUMPAD_DOWN: c_int = 110;
+pub const GHOSTTY_KEY_NUMPAD_RIGHT: c_int = 111;
+pub const GHOSTTY_KEY_NUMPAD_LEFT: c_int = 112;
+pub const GHOSTTY_KEY_NUMPAD_BEGIN: c_int = 113;
+pub const GHOSTTY_KEY_NUMPAD_HOME: c_int = 114;
+pub const GHOSTTY_KEY_NUMPAD_END: c_int = 115;
+pub const GHOSTTY_KEY_NUMPAD_INSERT: c_int = 116;
+pub const GHOSTTY_KEY_NUMPAD_DELETE: c_int = 117;
+pub const GHOSTTY_KEY_NUMPAD_PAGE_UP: c_int = 118;
+pub const GHOSTTY_KEY_NUMPAD_PAGE_DOWN: c_int = 119;
 // Function Keys
 pub const GHOSTTY_KEY_ESCAPE: c_int = 120;
 pub const GHOSTTY_KEY_F1: c_int = 121;
@@ -520,6 +570,8 @@ extern "C" {
     pub fn ghostty_config_load_default_files(config: ghostty_config_t);
     pub fn ghostty_config_load_recursive_files(config: ghostty_config_t);
     pub fn ghostty_config_finalize(config: ghostty_config_t);
+    pub fn ghostty_config_serialize(config: ghostty_config_t) -> ghostty_string_s;
+    pub fn ghostty_string_free(value: ghostty_string_s);
 
     // App
     pub fn ghostty_app_new(
@@ -540,6 +592,12 @@ extern "C" {
         app: ghostty_app_t,
         config: *const ghostty_surface_config_s,
     ) -> ghostty_surface_t;
+    pub fn ghostty_surface_new_with_argv(
+        app: ghostty_app_t,
+        config: *const ghostty_surface_config_s,
+        argv: *const *const c_char,
+        argv_len: usize,
+    ) -> ghostty_surface_t;
     pub fn ghostty_surface_free(surface: ghostty_surface_t);
     pub fn ghostty_surface_refresh(surface: ghostty_surface_t);
     pub fn ghostty_surface_display_unrealized(surface: ghostty_surface_t);
@@ -547,10 +605,16 @@ extern "C" {
     pub fn ghostty_surface_draw(surface: ghostty_surface_t);
     pub fn ghostty_surface_set_content_scale(surface: ghostty_surface_t, x: f64, y: f64);
     pub fn ghostty_surface_set_focus(surface: ghostty_surface_t, focused: bool);
+    pub fn ghostty_surface_set_occlusion(surface: ghostty_surface_t, visible: bool);
     pub fn ghostty_surface_set_size(surface: ghostty_surface_t, width: u32, height: u32);
     pub fn ghostty_surface_size(surface: ghostty_surface_t) -> ghostty_surface_size_s;
     pub fn ghostty_surface_process_exited(surface: ghostty_surface_t) -> bool;
     pub fn ghostty_surface_key(surface: ghostty_surface_t, event: ghostty_input_key_s) -> bool;
+    pub fn ghostty_surface_key_with_key(
+        surface: ghostty_surface_t,
+        event: ghostty_input_key_s,
+        resolved_key: c_int,
+    ) -> bool;
     pub fn ghostty_surface_text(surface: ghostty_surface_t, text: *const c_char, len: usize);
     pub fn ghostty_surface_preedit(surface: ghostty_surface_t, text: *const c_char, len: usize);
     pub fn ghostty_surface_mouse_button(
@@ -607,6 +671,10 @@ mod tests {
 
     #[test]
     fn embedding_struct_layouts_match_ghostty_header() {
+        assert_eq!(size_of::<ghostty_input_key_s>(), 32);
+        assert_eq!(align_of::<ghostty_input_key_s>(), 8);
+        assert_eq!(offset_of!(ghostty_input_key_s, composing), 28);
+
         assert_eq!(size_of::<ghostty_platform_u>(), 40);
         assert_eq!(align_of::<ghostty_platform_u>(), 8);
 

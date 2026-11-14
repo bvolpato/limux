@@ -15,6 +15,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 mod agent_hooks;
+mod agent_team_file;
+mod terminal_notifications;
 
 const CLI_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const CLI_STATE_LOCK_RETRY: Duration = Duration::from_millis(25);
@@ -207,6 +209,7 @@ Usage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> 
 Running `limux` with no arguments launches the GTK app.
 
 Common commands:
+  activate (present the existing window; never launch a new instance)
   identify [--workspace <id|ref>] [--surface <id|ref>]
   list-panels [--workspace <id|ref>]
   list-panes [--workspace <id|ref>]
@@ -218,11 +221,36 @@ Common commands:
   select-workspace --workspace <id|ref>
   close-workspace --workspace <id|ref>
   sidebar-state --workspace <id|ref>
-  new-surface [--workspace <id|ref>]
+  new-surface [--workspace <id|ref>] [--pane <id|ref>] [--type terminal|browser] [--url <url>]
+  close-surface [--workspace <id|ref>] [--surface <id|ref>]
+  focus-surface [--workspace <id|ref>] [--surface <id|ref>]
+  focus-pane [--workspace <id|ref>] [--pane <id|ref>]
   new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]
       Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.
   rename-workspace [--workspace <id|ref>] <title>
+  set-workspace-color [--workspace <id|ref>] <red|orange|amber|green|teal|blue|purple|pink|none>
+  list-groups
+  create-group [--color <color>] [--workspace <id|ref>]... [<name>]
+  rename-group --group <id|ref|name> <name>
+  set-group-color --group <id|ref|name> <color>
+  collapse-group --group <id|ref|name>
+  expand-group --group <id|ref|name>
+  delete-group --group <id|ref|name>   (only an empty group can be deleted)
+  set-workspace-group [--workspace <id|ref>] <group id|ref|name|none>
   rename-window [--workspace <id|ref>] <title>
+  gui-hooks list
+  gui-hooks set <event> [--command <text>] [--enable|--disable]
+      [--show-terminal|--no-show-terminal] [--suppress-default|--no-suppress-default]
+      <event>: on-workspace-create, after-workspace-create, on-workspace-delete
+      or after-workspace-delete. Runs <text> in bash when that action is done in
+      the GUI (not over the socket): an on-* hook before Limux does it, an
+      after-* hook once it is done.
+      --suppress-default (on-* hooks only) leaves the create/delete to the hook,
+      so Limux skips its folder prompt as well; the matching after-* hook then
+      does not run, since requests made through the CLI or socket never run hooks.
+      --disable keeps the hook's settings but stops it from running.
+  gui-hooks enable|disable <event>
+  gui-hooks clear <event>
   rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>
   read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]
   capture-pane (alias of read-screen)
@@ -230,8 +258,8 @@ Common commands:
   browser [--surface <id|ref>|<surface>] <subcommand> ...
 
 Agent integrations:
-  notify [--workspace <id|ref>] [--surface <id|ref>] [--subtitle <text>] [--body <text>] <title>
-  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>
+  notify [--workspace <id|ref>] [--surface <id|ref>] [--subtitle <text>] [--body <text>] [--osc] <title>
+  hooks setup [agent] [--osc] | hooks uninstall [agent] | hooks <agent> <event>
   claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]
   agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]
       Splits the active workspace into one pane per agent (caller's pane stays
@@ -391,6 +419,21 @@ fn parse_opt(args: &[String], name: &str) -> Option<String> {
     })
 }
 
+fn parse_terminal_surface(args: &[String]) -> Result<Option<String>> {
+    let Some(surface) = parse_opt(args, "--surface") else {
+        if parse_flag(args, "--surface") {
+            bail!("--surface requires a non-empty target");
+        }
+        return Ok(None);
+    };
+    let normalized = surface.trim();
+    let normalized = normalized.strip_prefix("surface:").unwrap_or(normalized);
+    if normalized.trim().is_empty() {
+        bail!("--surface requires a non-empty target");
+    }
+    Ok(Some(surface))
+}
+
 fn parse_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
@@ -455,6 +498,8 @@ fn trailing_title(args: &[String]) -> Option<String> {
             || arg == "--value"
             || arg == "--amount"
             || arg == "--unset"
+            || arg == "--group"
+            || arg == "--color"
         {
             skip = true;
             continue;
@@ -652,6 +697,30 @@ async fn selected_surface_for_pane(
     Ok(handle)
 }
 
+fn window_activation_params(activation_token: Option<&str>, startup_id: Option<&str>) -> Value {
+    match activation_token
+        .filter(|token| !token.is_empty())
+        .or_else(|| startup_id.filter(|token| !token.is_empty()))
+    {
+        Some(token) => json!({ "activation_token": token }),
+        None => json!({}),
+    }
+}
+
+async fn run_activate(client: &mut Client, args: &[String]) -> Result<Value> {
+    if !args.is_empty() {
+        bail!("activate takes no arguments; use --socket <path> before activate to target an instance");
+    }
+    let activation_token = env::var("XDG_ACTIVATION_TOKEN").ok();
+    let startup_id = env::var("DESKTOP_STARTUP_ID").ok();
+    client
+        .call(
+            "window.activate",
+            window_activation_params(activation_token.as_deref(), startup_id.as_deref()),
+        )
+        .await
+}
+
 async fn run_identify(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace");
     let surface = parse_opt(args, "--surface");
@@ -801,10 +870,8 @@ fn render_list_text(command: &str, payload: &Value) -> String {
 }
 
 async fn run_send(client: &mut Client, args: &[String]) -> Result<Value> {
-    let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
-        .filter(|s| !s.is_empty());
-    let surface = parse_opt(args, "--surface").filter(|s| !s.is_empty());
+    let surface = parse_terminal_surface(args)?;
+    let workspace = request_workspace(parse_opt(args, "--workspace"), surface.as_deref(), env_opt);
 
     let text = trailing_title(args).ok_or_else(|| anyhow!("send requires text"))?;
 
@@ -824,10 +891,8 @@ async fn run_send(client: &mut Client, args: &[String]) -> Result<Value> {
 }
 
 async fn run_send_key(client: &mut Client, args: &[String]) -> Result<Value> {
-    let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
-        .filter(|s| !s.is_empty());
-    let surface = parse_opt(args, "--surface").filter(|s| !s.is_empty());
+    let surface = parse_terminal_surface(args)?;
+    let workspace = request_workspace(parse_opt(args, "--workspace"), surface.as_deref(), env_opt);
     let key = trailing_title(args).ok_or_else(|| anyhow!("send-key requires key"))?;
 
     let mut params = Map::new();
@@ -842,7 +907,7 @@ async fn run_send_key(client: &mut Client, args: &[String]) -> Result<Value> {
 /// `limux notify` — post a notification into the sidebar + toast overlay.
 ///
 /// Usage:
-///   limux notify [--workspace <id|ref>] [--surface <id|ref>] [--subtitle <text>] [--body <text>] <title>
+///   limux notify [--workspace <id|ref>] [--surface <id|ref>] [--subtitle <text>] [--body <text>] [--osc] <title>
 ///   limux notify --title "..." --subtitle "..." --body "..."
 ///
 /// Mirrors the `cmux notify` shape (title / subtitle / body). Title is
@@ -858,11 +923,69 @@ fn notification_surface_target(
         .filter(|value| !value.is_empty())
 }
 
+/// The workspace and surface a notification names, as `request_workspace` scopes them.
+fn notification_scope(
+    args: &[String],
+    env_value: impl Fn(&str) -> Option<String>,
+) -> (Option<String>, Option<String>) {
+    let surface = notification_surface_target(args, &env_value);
+    let workspace = request_workspace(
+        parse_opt(args, "--workspace"),
+        surface.as_deref(),
+        env_value,
+    );
+    (workspace, surface)
+}
+
+/// Keep local socket delivery unchanged. Remote fallback is restricted to an
+/// unavailable socket; permission/protocol errors are not bypassed via OSC.
+async fn deliver_notification(
+    client: &mut Client,
+    workspace: Option<String>,
+    params: Map<String, Value>,
+    force: bool,
+) -> Result<Value> {
+    let force = force || terminal_notifications::forced();
+    let title = params
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let subtitle = params
+        .get("subtitle")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let body = params
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let body = if subtitle.is_empty() {
+        body.to_owned()
+    } else {
+        format!("{subtitle} — {body}")
+    };
+    if !force {
+        let result = call_in_workspace_scope(
+            client,
+            workspace,
+            "notification.create",
+            Value::Object(params),
+        )
+        .await;
+        let unavailable = result
+            .as_ref()
+            .err()
+            .is_some_and(terminal_notifications::socket_unavailable);
+        if !terminal_notifications::remote() || !unavailable {
+            return result;
+        }
+    }
+    tokio::task::spawn_blocking(move || terminal_notifications::emit(&title, &body)).await??;
+    Ok(json!({"delivered": "osc"}))
+}
+
 async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
-    let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
-        .filter(|s| !s.is_empty());
-    let surface = notification_surface_target(args, |key| env::var(key).ok());
+    let (workspace, surface) = notification_scope(args, env_opt);
 
     // Title can be provided either via --title or as the trailing positional
     // (matching `limux send`'s ergonomics).
@@ -887,13 +1010,7 @@ async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
         params.insert("surface_id".to_string(), Value::String(surface));
     }
 
-    call_in_workspace_scope(
-        client,
-        workspace,
-        "notification.create",
-        Value::Object(params),
-    )
-    .await
+    deliver_notification(client, workspace, params, parse_flag(args, "--osc")).await
 }
 
 // ---------------------------------------------------------------------------
@@ -958,91 +1075,72 @@ async fn run_agent_hook(
         serde_json::from_str(raw).unwrap_or_else(|_| json!({ "raw": raw }))
     };
 
-    // Explicit --event or positional event beats the JSON field.
-    let event = parse_hook_event(args, &payload);
+    let mut event = parse_hook_event(args, &payload);
+    // Older installers routed Claude Notification through positional stop.
+    // Preserve that payload's identity while honoring an explicit --event.
+    if agent == agent_hooks::AgentKind::Claude
+        && event == "stop"
+        && parse_opt(args, "--event").is_none()
+        && hook_str(&payload, &["hook_event_name"]) == Some("Notification")
+    {
+        event = "Notification".to_string();
+    }
 
     // Build a human-friendly title + body depending on event + agent.
     let agent_label = agent.label();
     persist_agent_hook_session(agent, args, &payload, &event)?;
-    let (title, body) = match event.as_str() {
-        "Notification" => (
+    let notification_title_body = match event.as_str() {
+        "Notification" | "notification" => Some((
             format!("{agent_label} needs you"),
             hook_str(&payload, &["message", "notification"])
                 .unwrap_or("waiting for input")
                 .to_owned(),
-        ),
-        "Stop" | "SubagentStop" => (
+        )),
+        "Stop" | "stop" | "finished" => Some((
             format!("{agent_label} finished"),
             hook_str(&payload, &["message", "reason"])
                 .unwrap_or("task complete")
                 .to_owned(),
-        ),
-        "SessionStart" => (
-            format!("{agent_label} session started"),
-            hook_str(&payload, &["cwd", "source"])
-                .unwrap_or("")
-                .to_owned(),
-        ),
-        "SessionEnd" => (
-            format!("{agent_label} session ended"),
-            hook_str(&payload, &["reason"]).unwrap_or("").to_owned(),
-        ),
-        "PreToolUse" | "PostToolUse" => (
-            format!(
-                "{agent_label}: {}",
-                hook_str(&payload, &["tool_name"]).unwrap_or("tool")
-            ),
-            hook_str(&payload, &["tool_input", "summary"])
-                .unwrap_or("")
-                .to_owned(),
-        ),
-        "UserPromptSubmit" => (
-            format!("{agent_label}: new prompt"),
-            hook_str(&payload, &["prompt"])
-                .unwrap_or("")
-                .chars()
-                .take(120)
-                .collect(),
-        ),
-        other => (
+        )),
+        "SessionStart" | "session-start" | "SessionEnd" | "session-end" | "UserPromptSubmit"
+        | "prompt-submit" | "PreToolUse" | "PostToolUse" | "SubagentStop" | "subagent-stop"
+        | "Cleanup" | "cleanup" | "restore-exit" => None,
+        other => Some((
             format!("{agent_label}: {other}"),
             hook_str(&payload, &["message", "summary"])
                 .unwrap_or("")
                 .to_owned(),
-        ),
+        )),
     };
 
-    let subtitle = hook_str(&payload, &["session_id"])
-        .map(|s| {
-            // Show only a short prefix of the session id to keep sidebar tidy.
-            s.chars().take(8).collect::<String>()
-        })
-        .unwrap_or_default();
+    if let Some((title, body)) = notification_title_body {
+        let subtitle = hook_str(&payload, &["session_id"])
+            .map(|s| {
+                // Show only a short prefix of the session id to keep sidebar tidy.
+                s.chars().take(8).collect::<String>()
+            })
+            .unwrap_or_default();
 
-    let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
-        .filter(|s| !s.is_empty());
-    let surface = notification_surface_target(args, |key| env::var(key).ok());
+        let (workspace, surface) = notification_scope(args, env_opt);
 
-    let mut params = Map::new();
-    params.insert("title".to_string(), Value::String(title));
-    if !subtitle.is_empty() {
-        params.insert("subtitle".to_string(), Value::String(subtitle));
-    }
-    if !body.is_empty() {
-        params.insert("body".to_string(), Value::String(body));
-    }
-    if let Some(surface) = surface {
-        params.insert("surface_id".to_string(), Value::String(surface));
-    }
+        let mut params = Map::new();
+        params.insert("title".to_string(), Value::String(title));
+        if !subtitle.is_empty() {
+            params.insert("subtitle".to_string(), Value::String(subtitle));
+        }
+        if !body.is_empty() {
+            params.insert("body".to_string(), Value::String(body));
+        }
+        if let Some(surface) = surface {
+            params.insert("surface_id".to_string(), Value::String(surface));
+        }
 
-    let _ = call_in_workspace_scope(
-        client,
-        workspace,
-        "notification.create",
-        Value::Object(params),
-    )
-    .await;
+        if let Err(error) = deliver_notification(client, workspace, params, false).await {
+            if terminal_notifications::forced() || terminal_notifications::remote() {
+                eprintln!("limux: notification not delivered: {error:#}");
+            }
+        }
+    }
 
     Ok(agent_hook_output(&event, &payload))
 }
@@ -1127,7 +1225,9 @@ fn persist_agent_hook_session(
     let store = agent_hooks::AgentHookSessionStore::new(agent);
     match agent_hook_persistence_action(event) {
         AgentHookPersistenceAction::Remove => {
-            let result = store.remove(&session_id);
+            let (workspace_id, surface_id) =
+                agent_hook_cleanup_scope(args, payload, limux_env_value);
+            let result = store.remove(&session_id, workspace_id.as_deref(), surface_id.as_deref());
             if result.is_ok() {
                 write_agent_hook_debug(
                     agent,
@@ -1179,30 +1279,27 @@ fn persist_agent_hook_session(
         return Ok(());
     };
 
-    let existing = store.lookup(&session_id)?;
-    let cwd = hook_str(payload, &["cwd", "working_directory", "directory"])
-        .map(str::to_string)
-        .or_else(|| existing.as_ref().and_then(|record| record.cwd.clone()));
-    let pid = hook_str(payload, &["pid"])
-        .and_then(|value| value.parse::<u32>().ok())
-        .or_else(|| agent_ancestor_pid(agent))
-        .or_else(|| existing.as_ref().and_then(|record| record.pid));
-    let launch_command = agent_hooks::launch_record_from_env(agent, cwd.as_deref()).or_else(|| {
-        existing
-            .as_ref()
-            .and_then(|record| record.launch_command.clone())
-    });
+    let result = store.update(&session_id, |existing| {
+        let cwd = hook_str(payload, &["cwd", "working_directory", "directory"])
+            .map(str::to_string)
+            .or_else(|| existing.and_then(|record| record.cwd.clone()));
+        let pid = hook_str(payload, &["pid"])
+            .and_then(|value| value.parse::<u32>().ok())
+            .or_else(|| agent_ancestor_pid(agent))
+            .or_else(|| existing.and_then(|record| record.pid));
+        let launch_command = agent_hooks::launch_record_from_env(agent, cwd.as_deref())
+            .or_else(|| existing.and_then(|record| record.launch_command.clone()));
 
-    let record = agent_hooks::AgentHookSessionRecord {
-        session_id,
-        workspace_id,
-        surface_id,
-        cwd,
-        pid,
-        launch_command,
-        updated_at: agent_hooks::now_seconds(),
-    };
-    let result = store.upsert(record);
+        agent_hooks::AgentHookSessionRecord {
+            session_id: session_id.clone(),
+            workspace_id,
+            surface_id,
+            cwd,
+            pid,
+            launch_command,
+            updated_at: agent_hooks::now_seconds(),
+        }
+    });
     if result.is_ok() {
         write_agent_hook_debug(
             agent,
@@ -1214,6 +1311,21 @@ fn persist_agent_hook_session(
         );
     }
     result
+}
+
+fn agent_hook_cleanup_scope(
+    args: &[String],
+    payload: &Value,
+    env_value: impl Fn(&str) -> Option<String>,
+) -> (Option<String>, Option<String>) {
+    let workspace = parse_opt(args, "--workspace")
+        .or_else(|| env_value("LIMUX_WORKSPACE_ID"))
+        .or_else(|| hook_str(payload, &["workspace_id"]).map(str::to_string));
+    let surface = parse_opt(args, "--surface")
+        .or_else(|| env_value("LIMUX_SURFACE_ID"))
+        .or_else(|| env_value("LIMUX_TAB_ID"))
+        .or_else(|| hook_str(payload, &["surface_id", "tab_id"]).map(str::to_string));
+    (workspace, surface)
 }
 
 fn hook_session_id(payload: &Value) -> Option<String> {
@@ -1403,7 +1515,7 @@ async fn run_hooks_command(
     match first {
         "setup" | "install" => {
             let target = parse_opt(args, "--agent").or_else(|| positional_arg(args, 1));
-            let installed = install_hook_targets(target.as_deref())?;
+            let installed = install_hook_targets(target.as_deref(), parse_flag(args, "--osc"))?;
             return hooks_summary_output("installed", installed, json_output);
         }
         "uninstall" => {
@@ -1419,7 +1531,7 @@ async fn run_hooks_command(
     let rest = &args[1..];
     match rest.first().map(String::as_str) {
         Some("install") => {
-            install_hook_target(agent)?;
+            install_hook_target(agent, parse_flag(rest, "--osc"))?;
             hooks_summary_output(
                 "installed",
                 vec![agent.store_name().to_string()],
@@ -1467,7 +1579,7 @@ fn hooks_summary_output(
     }
 }
 
-fn install_hook_targets(target: Option<&str>) -> Result<Vec<String>> {
+fn install_hook_targets(target: Option<&str>, osc: bool) -> Result<Vec<String>> {
     let agents = target
         .map(|name| {
             agent_hooks::AgentKind::from_hook_name(name)
@@ -1479,7 +1591,7 @@ fn install_hook_targets(target: Option<&str>) -> Result<Vec<String>> {
 
     let mut installed = Vec::new();
     for agent in agents {
-        install_hook_target(agent)?;
+        install_hook_target(agent, osc)?;
         installed.push(agent.store_name().to_string());
     }
     Ok(installed)
@@ -1511,11 +1623,12 @@ fn default_hook_targets() -> Vec<agent_hooks::AgentKind> {
     ]
 }
 
-fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
+fn install_hook_target(agent: agent_hooks::AgentKind, osc: bool) -> Result<()> {
     match agent {
         agent_hooks::AgentKind::Codex => install_json_hooks(
             &codex_hooks_path(),
             agent,
+            osc,
             &[
                 ("SessionStart", "session-start"),
                 ("UserPromptSubmit", "prompt-submit"),
@@ -1525,18 +1638,23 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
         agent_hooks::AgentKind::Claude => install_json_hooks(
             &claude_settings_path(),
             agent,
+            osc,
             &[
                 ("SessionStart", "session-start"),
                 ("UserPromptSubmit", "prompt-submit"),
                 ("Stop", "stop"),
-                ("Notification", "stop"),
+                ("Notification", "notification"),
                 ("SessionEnd", "session-end"),
             ],
         ),
+        agent_hooks::AgentKind::OpenCode if osc => {
+            bail!("OSC hook setup supports Codex, Claude, and Gemini")
+        }
         agent_hooks::AgentKind::OpenCode => install_opencode_plugin(),
         agent_hooks::AgentKind::Gemini => install_json_hooks(
             &gemini_settings_path(),
             agent,
+            osc,
             &[
                 ("SessionStart", "session-start"),
                 ("BeforeAgent", "prompt-submit"),
@@ -1566,6 +1684,7 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
 fn install_json_hooks(
     path: &Path,
     agent: agent_hooks::AgentKind,
+    osc: bool,
     events: &[(&str, &str)],
 ) -> Result<()> {
     let mut root = read_json_object(path)?;
@@ -1599,7 +1718,7 @@ fn install_json_hooks(
         let mut entry = json!({
             "hooks": [{
                 "type": "command",
-                "command": hook_command(agent, limux_event)?,
+                "command": hook_command(agent, limux_event, osc)?,
                 "statusMessage": format!("Limux {} session restore", agent.label()),
                 "timeout": hook_timeout(agent)
             }]
@@ -1683,12 +1802,17 @@ fn opencode_config_unregister_plugin() -> Result<()> {
     write_json_object(&config_path, &root)
 }
 
-fn hook_command(agent: agent_hooks::AgentKind, event: &str) -> Result<String> {
+fn hook_command(agent: agent_hooks::AgentKind, event: &str, osc: bool) -> Result<String> {
     let disable_var = format!(
         "LIMUX_{}_HOOKS_DISABLED",
         agent.store_name().to_ascii_uppercase()
     );
     let limux_command = hook_cli_command()?;
+    let limux_command = if osc {
+        format!("env LIMUX_NOTIFY_OSC=1 {limux_command}")
+    } else {
+        limux_command
+    };
     Ok(format!(
         "[ \"${{{disable_var}:-}}\" != \"1\" ] && {limux_command} --json hooks {} {} || echo '{{\"continue\":true,\"suppressOutput\":false}}'",
         agent.store_name(),
@@ -1697,6 +1821,9 @@ fn hook_command(agent: agent_hooks::AgentKind, event: &str) -> Result<String> {
 }
 
 fn hook_cli_command() -> Result<String> {
+    if let Some(path) = limux_control::flatpak::host_cli_executable() {
+        return Ok(shell_single_quote(&path.to_string_lossy()));
+    }
     let exe = env::current_exe().context("failed to resolve current executable")?;
     let file_name = exe
         .file_name()
@@ -1709,6 +1836,9 @@ fn hook_cli_command() -> Result<String> {
 }
 
 fn opencode_plugin_cli_command() -> Result<String> {
+    if let Some(path) = limux_control::flatpak::host_cli_executable() {
+        return Ok(path.to_string_lossy().into_owned());
+    }
     let exe = env::current_exe().context("failed to resolve current executable")?;
     let file_name = exe
         .file_name()
@@ -2018,7 +2148,7 @@ async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
         bail!("agent-team: --agents is empty");
     }
 
-    let cwd = parse_opt(args, "--cwd")
+    let requested_cwd = parse_opt(args, "--cwd")
         .or_else(|| {
             env::current_dir()
                 .ok()
@@ -2030,6 +2160,16 @@ async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
     // the agents manually) — still splits the panes + writes AGENTS.md.
     let no_launch = args.iter().any(|a| a == "--no-launch");
     let dry_run = args.iter().any(|a| a == "--dry-run");
+    let cwd = if dry_run {
+        std::path::absolute(&requested_cwd)
+    } else {
+        fs::canonicalize(&requested_cwd)
+    }
+    .context("agent-team: could not resolve cwd")?;
+    if !dry_run && !cwd.is_dir() {
+        bail!("agent-team: cwd must be a directory");
+    }
+    let cwd = cwd.to_string_lossy().into_owned();
 
     // Resolve the agent list up front so --dry-run can build a deterministic
     // peer table without touching the host.
@@ -2070,12 +2210,6 @@ async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
             "<dry-run-workspace>",
             "<dry-run-orchestrator>",
         );
-        if let Err(err) = std::fs::write(&agents_md_path, body) {
-            eprintln!(
-                "agent-team: failed to write {}: {err}",
-                agents_md_path.display()
-            );
-        }
         return Ok(json!({
             "ok": true,
             "cwd": cwd,
@@ -2083,6 +2217,7 @@ async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
             "workspace_id": Value::Null,
             "orchestrator_surface_id": Value::Null,
             "agents_md": agents_md_path.to_string_lossy(),
+            "agents_md_preview": body,
             "dry_run": true,
             "no_launch": no_launch,
             "peers": peers
@@ -2098,6 +2233,9 @@ async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
                 .collect::<Vec<_>>(),
         }));
     }
+
+    // Reject existing instructions and check the destination before creating panes.
+    let instructions = agent_team_file::PendingInstructions::new(&agents_md_path)?;
 
     // 1. Resolve the orchestrator's workspace + pane. Prefer LIMUX_* env (set
     //    in every limux-spawned terminal) and fall back to the host's active
@@ -2190,9 +2328,10 @@ async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
             Value::String(direction.to_string()),
         );
         params.insert("type".to_string(), Value::String("terminal".to_string()));
-        if !no_launch {
-            params.insert("command".to_string(), Value::String(launch.clone()));
-        }
+        params.insert(
+            "command".to_string(),
+            Value::String(instructions.pane_command((!no_launch).then_some(launch.as_str()))),
+        );
 
         let created = client
             .call("pane.create", Value::Object(params))
@@ -2208,7 +2347,8 @@ async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
         peers.push((name.to_string(), pane_id, surface_id, launch.clone()));
     }
 
-    // 5. Write AGENTS.md into the shared cwd, clobbering any existing file.
+    // 5. Publish all peer IDs before releasing the gated startup commands.
+    // Dropping the stage on any earlier error prevents every agent from launching.
     let body = build_agents_md(
         &peers,
         &cwd,
@@ -2216,12 +2356,7 @@ async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
         &workspace_id,
         &orchestrator_surface,
     );
-    if let Err(err) = std::fs::write(&agents_md_path, body) {
-        eprintln!(
-            "agent-team: failed to write {}: {err}",
-            agents_md_path.display()
-        );
-    }
+    instructions.publish(&body)?;
 
     Ok(json!({
         "ok": true,
@@ -2373,7 +2508,7 @@ fn build_agents_md(
     out.push_str("---\n");
     out.push_str(
         "_Generated by `limux agent-team`. Safe to edit the Policies\n\
-         section; regenerating will overwrite everything above it._\n",
+         section; keep or move this file before creating another team._\n",
     );
 
     out
@@ -2386,6 +2521,74 @@ async fn run_close_workspace(client: &mut Client, args: &[String]) -> Result<Val
     client
         .call("workspace.close", json!({ "workspace_id": workspace }))
         .await
+}
+
+async fn run_close_surface(client: &mut Client, args: &[String]) -> Result<Value> {
+    let params = lifecycle_scope(args, Some(("--surface", "surface_id", "LIMUX_SURFACE_ID")))?;
+    client.call("surface.close", Value::Object(params)).await
+}
+
+async fn run_focus_surface(client: &mut Client, args: &[String]) -> Result<Value> {
+    let params = lifecycle_scope(args, Some(("--surface", "surface_id", "LIMUX_SURFACE_ID")))?;
+    client.call("surface.focus", Value::Object(params)).await
+}
+
+async fn run_focus_pane(client: &mut Client, args: &[String]) -> Result<Value> {
+    let params = lifecycle_scope(args, Some(("--pane", "pane_id", "LIMUX_PANE_ID")))?;
+    client.call("pane.focus", Value::Object(params)).await
+}
+
+async fn run_new_surface(client: &mut Client, args: &[String]) -> Result<Value> {
+    let mut params = lifecycle_scope(args, Some(("--pane", "pane_id", "LIMUX_PANE_ID")))?;
+    for (flag, key) in [("--type", "type"), ("--url", "url")] {
+        if let Some(value) = lifecycle_option(args, flag)? {
+            params.insert(key.to_string(), Value::String(value));
+        }
+    }
+    client.call("surface.create", Value::Object(params)).await
+}
+
+fn lifecycle_option(args: &[String], flag: &str) -> Result<Option<String>> {
+    let value = parse_opt(args, flag);
+    if parse_flag(args, flag)
+        && value
+            .as_ref()
+            .is_none_or(|value| value.trim().is_empty() || value.starts_with("--"))
+    {
+        bail!("{flag} requires a non-empty value");
+    }
+    Ok(value)
+}
+
+fn lifecycle_scope(
+    args: &[String],
+    target: Option<(&str, &str, &str)>,
+) -> Result<Map<String, Value>> {
+    let mut params = Map::new();
+    let explicit_workspace = lifecycle_option(args, "--workspace")?;
+    let target = match target {
+        Some((flag, key, env_key)) => {
+            // An explicit workspace must not inherit the caller's target from another workspace.
+            let value = lifecycle_option(args, flag)?.or_else(|| {
+                (!parse_flag(args, "--workspace"))
+                    .then(|| env::var(env_key).ok().filter(|value| !value.is_empty()))
+                    .flatten()
+            });
+            value.map(|value| (key, value))
+        }
+        None => None,
+    };
+    let surface = target
+        .as_ref()
+        .filter(|(key, _)| *key == "surface_id")
+        .map(|(_, value)| value.as_str());
+    if let Some(workspace) = request_workspace(explicit_workspace, surface, env_opt) {
+        params.insert("workspace_id".to_string(), Value::String(workspace));
+    }
+    if let Some((key, value)) = target {
+        params.insert(key.to_string(), Value::String(value));
+    }
+    Ok(params)
 }
 
 /// `limux select-workspace --workspace <id|ref>` — bring a workspace to the front.
@@ -2454,11 +2657,6 @@ async fn run_sidebar_state(client: &mut Client, args: &[String]) -> Result<Value
     }))
 }
 
-async fn run_new_surface(client: &mut Client, args: &[String]) -> Result<Value> {
-    let workspace = parse_opt(args, "--workspace");
-    call_in_workspace_scope(client, workspace, "surface.create", json!({})).await
-}
-
 fn env_opt(name: &str) -> Option<String> {
     env::var(name).ok()
 }
@@ -2467,13 +2665,35 @@ fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.trim().is_empty())
 }
 
+/// The workspace a request is scoped to: an explicit `--workspace`, where an
+/// empty one means unscoped, else the caller's LIMUX_WORKSPACE_ID unless the
+/// request names a surface. A shell keeps that variable after its tab moves to
+/// another workspace, so a named surface is sent unscoped and the host looks
+/// for it in every workspace.
+fn request_workspace(
+    explicit: Option<String>,
+    surface: Option<&str>,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    match explicit {
+        Some(explicit) => nonempty(Some(explicit)),
+        None => surface
+            .is_none()
+            .then(|| nonempty(env_lookup("LIMUX_WORKSPACE_ID")))
+            .flatten(),
+    }
+}
+
 fn build_new_pane_request(
     args: &[String],
     env_lookup: impl Fn(&str) -> Option<String>,
 ) -> (Option<String>, Value) {
-    let workspace =
-        nonempty(parse_opt(args, "--workspace").or_else(|| env_lookup("LIMUX_WORKSPACE_ID")));
     let surface = nonempty(parse_opt(args, "--surface").or_else(|| env_lookup("LIMUX_SURFACE_ID")));
+    let workspace = request_workspace(
+        parse_opt(args, "--workspace"),
+        surface.as_deref(),
+        &env_lookup,
+    );
     let pane = nonempty(parse_opt(args, "--pane").or_else(|| env_lookup("LIMUX_PANE_ID")));
     let direction = parse_opt(args, "--direction").unwrap_or_else(|| "right".to_string());
     let pane_type = parse_opt(args, "--type").unwrap_or_else(|| "terminal".to_string());
@@ -2518,7 +2738,7 @@ async fn run_read_screen(client: &mut Client, args: &[String]) -> Result<Value> 
     }
 
     let workspace = parse_opt(args, "--workspace");
-    let surface = parse_opt(args, "--surface");
+    let surface = parse_terminal_surface(args)?;
     let mut params = Map::new();
     if let Some(workspace) = workspace {
         params.insert("workspace_id".to_string(), Value::String(workspace));
@@ -2530,6 +2750,227 @@ async fn run_read_screen(client: &mut Client, args: &[String]) -> Result<Value> 
     client
         .call("surface.read_text", Value::Object(params))
         .await
+}
+
+/// Build the `workspace.set_color` params; the host validates the colour name.
+fn build_set_workspace_color_params(
+    args: &[String],
+    env_value: impl Fn(&str) -> Option<String>,
+) -> Result<Value> {
+    let color = trailing_title(args)
+        .ok_or_else(|| anyhow!("set-workspace-color requires a color name or \"none\""))?;
+
+    let mut params = Map::new();
+    params.insert("color".to_string(), Value::String(color));
+    if let Some(workspace) =
+        parse_opt(args, "--workspace").or_else(|| env_value("LIMUX_WORKSPACE_ID"))
+    {
+        params.insert("workspace_id".to_string(), Value::String(workspace));
+    }
+    Ok(Value::Object(params))
+}
+
+/// The socket method and params of a sidebar workspace-group command.
+fn build_group_request(
+    command: &str,
+    args: &[String],
+    env_value: impl Fn(&str) -> Option<String>,
+) -> Result<(&'static str, Value)> {
+    let mut params = Map::new();
+    let group = || {
+        parse_opt(args, "--group")
+            .filter(|group| !group.trim().is_empty())
+            .ok_or_else(|| anyhow!("{command} requires --group <id|ref|name>"))
+    };
+    let method = match command {
+        "list-groups" => "workspace.group_list",
+        "create-group" => {
+            if let Some(name) = trailing_title(args) {
+                params.insert("name".to_string(), Value::String(name));
+            }
+            if let Some(color) = parse_opt(args, "--color") {
+                params.insert("color".to_string(), Value::String(color));
+            }
+            let workspaces: Vec<Value> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "--workspace")
+                .map(|pair| Value::String(pair[1].clone()))
+                .collect();
+            if !workspaces.is_empty() {
+                params.insert("workspace_ids".to_string(), Value::Array(workspaces));
+            }
+            "workspace.group_create"
+        }
+        "rename-group" => {
+            params.insert("group_id".to_string(), Value::String(group()?));
+            let name =
+                trailing_title(args).ok_or_else(|| anyhow!("rename-group requires a name"))?;
+            params.insert("name".to_string(), Value::String(name));
+            "workspace.group_rename"
+        }
+        "set-group-color" => {
+            params.insert("group_id".to_string(), Value::String(group()?));
+            let color = trailing_title(args)
+                .ok_or_else(|| anyhow!("set-group-color requires a color name"))?;
+            params.insert("color".to_string(), Value::String(color));
+            "workspace.group_set_color"
+        }
+        "collapse-group" | "expand-group" => {
+            params.insert("group_id".to_string(), Value::String(group()?));
+            params.insert(
+                "collapsed".to_string(),
+                Value::Bool(command == "collapse-group"),
+            );
+            "workspace.group_set_collapsed"
+        }
+        "delete-group" => {
+            params.insert("group_id".to_string(), Value::String(group()?));
+            "workspace.group_delete"
+        }
+        "set-workspace-group" => {
+            let group = trailing_title(args).ok_or_else(|| {
+                anyhow!("set-workspace-group requires a group, or \"none\" to ungroup")
+            })?;
+            let group = if group.eq_ignore_ascii_case("none") {
+                Value::Null
+            } else {
+                Value::String(group)
+            };
+            params.insert("group_id".to_string(), group);
+            if let Some(workspace) =
+                parse_opt(args, "--workspace").or_else(|| env_value("LIMUX_WORKSPACE_ID"))
+            {
+                params.insert("workspace_id".to_string(), Value::String(workspace));
+            }
+            "workspace.set_group"
+        }
+        _ => bail!("unsupported group command {command}"),
+    };
+    Ok((method, Value::Object(params)))
+}
+
+/// The socket method and params of a `gui-hooks` subcommand.
+fn build_gui_hooks_request(args: &[String]) -> Result<(&'static str, Value)> {
+    const USAGE: &str = "gui-hooks list | set <event> [--command <text>] [--enable|--disable] [--show-terminal|--no-show-terminal] [--suppress-default|--no-suppress-default] | enable <event> | disable <event> | clear <event>, where <event> is on-workspace-create, after-workspace-create, on-workspace-delete or after-workspace-delete";
+    let (subcommand, rest) = args
+        .split_first()
+        .ok_or_else(|| anyhow!("usage: limux {USAGE}"))?;
+    let event = || {
+        rest.first()
+            .filter(|event| !event.starts_with('-'))
+            .cloned()
+            .ok_or_else(|| anyhow!("gui-hooks {subcommand} requires an event: on-workspace-create, after-workspace-create, on-workspace-delete or after-workspace-delete"))
+    };
+    let toggle = |on: &str, off: &str| -> Result<Option<bool>> {
+        match (parse_flag(rest, on), parse_flag(rest, off)) {
+            (true, true) => bail!("{on} and {off} cannot be combined"),
+            (true, false) => Ok(Some(true)),
+            (false, true) => Ok(Some(false)),
+            (false, false) => Ok(None),
+        }
+    };
+    match subcommand.as_str() {
+        "list" => Ok(("gui_hook.list", json!({}))),
+        "set" => {
+            let mut params = Map::new();
+            params.insert("event".to_string(), Value::String(event()?));
+            if let Some(command) = parse_opt(rest, "--command") {
+                params.insert("command".to_string(), Value::String(command));
+            } else if parse_flag(rest, "--command") {
+                bail!("--command requires the command to run");
+            }
+            for (key, on, off) in [
+                ("enabled", "--enable", "--disable"),
+                ("show_terminal", "--show-terminal", "--no-show-terminal"),
+                (
+                    "suppress_default",
+                    "--suppress-default",
+                    "--no-suppress-default",
+                ),
+            ] {
+                if let Some(value) = toggle(on, off)? {
+                    params.insert(key.to_string(), Value::Bool(value));
+                }
+            }
+            if params.len() == 1 {
+                bail!("gui-hooks set requires --command, --enable/--disable, --[no-]show-terminal or --[no-]suppress-default");
+            }
+            Ok(("gui_hook.set", Value::Object(params)))
+        }
+        "enable" | "disable" => Ok((
+            "gui_hook.set",
+            json!({ "event": event()?, "enabled": subcommand == "enable" }),
+        )),
+        "clear" => Ok(("gui_hook.clear", json!({ "event": event()? }))),
+        other => bail!("unknown gui-hooks subcommand `{other}`; usage: limux {USAGE}"),
+    }
+}
+
+fn render_gui_hook(hook: &Value) -> String {
+    let event = get_string(hook, &["event"]).unwrap_or_default();
+    if hook.get("configured").and_then(Value::as_bool) != Some(true) {
+        return format!("{event}: not set");
+    }
+    let command = get_string(hook, &["command"]).unwrap_or_default();
+    let flag = |key| hook.get(key).and_then(Value::as_bool) == Some(true);
+    let mut notes = Vec::new();
+    // Hosts from before the switch existed do not report it.
+    if hook.get("enabled").and_then(Value::as_bool) == Some(false) {
+        notes.push("disabled");
+    }
+    notes.push(if flag("show_terminal") {
+        "in a terminal"
+    } else {
+        "in the background"
+    });
+    if flag("suppress_default") {
+        notes.push("default action skipped");
+    }
+    format!("{event}: {command} ({})", notes.join(", "))
+}
+
+fn render_gui_hooks(payload: &Value) -> String {
+    match payload.get("hooks").and_then(Value::as_array) {
+        Some(hooks) => hooks
+            .iter()
+            .map(render_gui_hook)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => render_gui_hook(payload),
+    }
+}
+
+fn render_group_list(payload: &Value) -> String {
+    let groups = payload
+        .get("groups")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if groups.is_empty() {
+        return "No groups".to_string();
+    }
+    groups
+        .iter()
+        .map(|group| {
+            let handle = get_string(group, &["ref", "id"]).unwrap_or_default();
+            let name = get_string(group, &["name"]).unwrap_or_default();
+            let color = get_string(group, &["color"]).unwrap_or_default();
+            let count = group
+                .get("workspace_ids")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let collapsed = if group.get("collapsed").and_then(Value::as_bool) == Some(true) {
+                ", collapsed"
+            } else {
+                ""
+            };
+            format!(
+                "{handle} {name} ({color}, {count} workspace{}{collapsed})",
+                if count == 1 { "" } else { "s" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn run_rename_workspace_like(
@@ -2556,23 +2997,11 @@ async fn run_rename_workspace_like(
 }
 
 async fn run_rename_tab(client: &mut Client, args: &[String]) -> Result<Value> {
-    let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
-        .unwrap_or_default();
-    let tab = parse_opt(args, "--tab")
-        .or_else(|| env::var("LIMUX_TAB_ID").ok())
-        .unwrap_or_default();
+    let mut params = lifecycle_scope(args, Some(("--tab", "surface_id", "LIMUX_TAB_ID")))?;
     let title = trailing_title(args).ok_or_else(|| anyhow!("rename-tab requires a title"))?;
 
-    let mut params = Map::new();
     params.insert("action".to_string(), Value::String("rename".to_string()));
     params.insert("title".to_string(), Value::String(title));
-    if !workspace.is_empty() {
-        params.insert("workspace_id".to_string(), Value::String(workspace));
-    }
-    if !tab.is_empty() {
-        params.insert("surface_id".to_string(), Value::String(tab));
-    }
 
     client.call("tab.action", Value::Object(params)).await
 }
@@ -2580,14 +3009,21 @@ async fn run_rename_tab(client: &mut Client, args: &[String]) -> Result<Value> {
 async fn run_tab_action(client: &mut Client, args: &[String]) -> Result<Value> {
     if parse_flag(args, "--help") {
         return Ok(json!({
-            "help": "Usage: limux tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\nTarget tab:\n  --tab tab:<n>       Stable tab reference alias\n  --tab surface:<n>   Surface alias (legacy-compatible)\nExamples:\n  limux tab-action --workspace workspace:2 --tab tab:1 --action pin\n  limux tab-action --tab tab:3 --action mark-unread"
+            "help": "Usage: limux tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\nLive GTK actions: rename, set-title, pin, unpin, select, activate, focus, close.\nTargets accept a raw tab ID, tab:<tab-id>, or surface:<pane-id>:<tab-id>. Omitted targets use the caller's tab or the selected workspace's focused tab.\nPass --title '' with rename to clear a custom name."
         }));
     }
 
     let action = parse_opt(args, "--action")
         .ok_or_else(|| anyhow!("tab-action requires --action <name>"))?;
-    let workspace = parse_opt(args, "--workspace").or_else(|| env::var("LIMUX_WORKSPACE_ID").ok());
-    let tab = parse_opt(args, "--tab").or_else(|| env::var("LIMUX_TAB_ID").ok());
+    let mut params = lifecycle_scope(args, Some(("--tab", "surface_id", "LIMUX_TAB_ID")))?;
+    let workspace = params
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let tab = params
+        .get("surface_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let title = parse_opt(args, "--title").or_else(|| trailing_title(args));
     let url = parse_opt(args, "--url");
 
@@ -2620,14 +3056,7 @@ async fn run_tab_action(client: &mut Client, args: &[String]) -> Result<Value> {
         }));
     }
 
-    let mut params = Map::new();
     params.insert("action".to_string(), Value::String(action.clone()));
-    if let Some(workspace) = workspace {
-        params.insert("workspace_id".to_string(), Value::String(workspace));
-    }
-    if let Some(tab) = tab.clone() {
-        params.insert("surface_id".to_string(), Value::String(tab));
-    }
     if let Some(title) = title {
         params.insert("title".to_string(), Value::String(title));
     }
@@ -3466,6 +3895,14 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
 
     let mut out = match command {
         "--version" | "-V" => CommandOutput::Text(format!("limux {}", env!("CARGO_PKG_VERSION"))),
+        "activate" => {
+            let payload = run_activate(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
         "identify" => CommandOutput::Json(run_identify(client, args).await?),
         "list-panels" | "list-panes" | "list-workspaces" | "surface-health" => {
             let payload = run_list(client, command, args).await?;
@@ -3523,6 +3960,30 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             } else {
                 let handle = handle_from_payload(&payload, "workspace_id", "workspace_ref");
                 CommandOutput::Text(format!("OK {}", handle))
+            }
+        }
+        "close-surface" => {
+            let payload = run_close_surface(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
+        "focus-surface" => {
+            let payload = run_focus_surface(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
+        "focus-pane" => {
+            let payload = run_focus_pane(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
             }
         }
         "select-workspace" => {
@@ -3619,6 +4080,42 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Json(payload)
             } else {
                 CommandOutput::Text("OK".to_string())
+            }
+        }
+        "set-workspace-color" => {
+            let params = build_set_workspace_color_params(args, |name| env::var(name).ok())?;
+            let payload = client.call("workspace.set_color", params).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
+        "list-groups"
+        | "create-group"
+        | "rename-group"
+        | "set-group-color"
+        | "collapse-group"
+        | "expand-group"
+        | "delete-group"
+        | "set-workspace-group" => {
+            let (method, params) = build_group_request(command, args, |name| env::var(name).ok())?;
+            let payload = client.call(method, params).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else if command == "list-groups" {
+                CommandOutput::Text(render_group_list(&payload))
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
+        "gui-hooks" => {
+            let (method, params) = build_gui_hooks_request(args)?;
+            let payload = client.call(method, params).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(render_gui_hooks(&payload))
             }
         }
         "rename-tab" => {
@@ -3777,6 +4274,129 @@ mod cli_arg_tests {
     }
 
     #[test]
+    fn activation_prefers_xdg_token_and_preserves_opaque_values() {
+        assert_eq!(window_activation_params(None, None), json!({}));
+        assert_eq!(window_activation_params(Some(""), Some("")), json!({}));
+        assert_eq!(
+            window_activation_params(Some(""), Some("launcher_TIME123")),
+            json!({ "activation_token": "launcher_TIME123" })
+        );
+        assert_eq!(
+            window_activation_params(None, Some("launcher_TIME123")),
+            json!({ "activation_token": "launcher_TIME123" })
+        );
+        assert_eq!(
+            window_activation_params(Some(" opaque token "), Some("launcher_TIME123")),
+            json!({ "activation_token": " opaque token " })
+        );
+    }
+
+    #[tokio::test]
+    async fn activate_requires_an_existing_socket_and_rejects_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("absent.sock");
+        let mut client = Client::new(socket.clone());
+        let opts = default_opts(args(&["activate"]));
+        assert!(!should_launch_host(&opts));
+        let error = execute_command(&mut client, &opts).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("failed to connect to socket {}", socket.display())
+        );
+
+        let error = execute_command(
+            &mut client,
+            &default_opts(args(&["activate", "--workspace", "other"])),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().starts_with("activate takes no arguments"));
+    }
+
+    #[tokio::test]
+    async fn terminal_commands_reject_empty_explicit_surface_before_connecting() {
+        for command in ["send", "send-key", "read-screen"] {
+            for target in ["", "   ", "surface:", " surface:   "] {
+                let mut client = Client::new(PathBuf::from("/does/not/exist.sock"));
+                let mut command_args = args(&[command, "--surface", target]);
+                if command == "send" {
+                    command_args.push("must not be sent".into());
+                }
+                if command == "send-key" {
+                    command_args.push("Enter".into());
+                }
+                let error = execute_command(&mut client, &default_opts(command_args))
+                    .await
+                    .expect_err("invalid target must fail locally");
+                assert_eq!(
+                    error.to_string(),
+                    "--surface requires a non-empty target",
+                    "{command} {target:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_surface_option_preserves_omission_and_valid_handles() {
+        assert_eq!(parse_terminal_surface(&args(&["payload"])).unwrap(), None);
+        assert!(parse_terminal_surface(&args(&["--surface"])).is_err());
+        for target in ["tab-id", "4:tab-id", "surface:4:tab-id"] {
+            assert_eq!(
+                parse_terminal_surface(&args(&["--surface", target])).unwrap(),
+                Some(target.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_options_reject_explicit_empty_or_missing_values() {
+        for flag in ["--workspace", "--pane", "--surface", "--type", "--url"] {
+            for values in [
+                vec![flag],
+                vec![flag, ""],
+                vec![flag, " "],
+                vec![flag, "--other"],
+            ] {
+                assert!(
+                    lifecycle_option(&args(&values), flag).is_err(),
+                    "{values:?}"
+                );
+            }
+            assert_eq!(lifecycle_option(&args(&[]), flag).unwrap(), None);
+            assert_eq!(
+                lifecycle_option(&args(&[flag, "value"]), flag).unwrap(),
+                Some("value".to_string())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_commands_reject_empty_targets_before_connecting() {
+        for (command, target_flag) in [
+            ("new-surface", "--pane"),
+            ("focus-pane", "--pane"),
+            ("focus-surface", "--surface"),
+            ("close-surface", "--surface"),
+            ("rename-tab", "--tab"),
+            ("tab-action", "--tab"),
+        ] {
+            for flag in [target_flag, "--workspace"] {
+                let mut client = Client::new(PathBuf::from("/does/not/exist.sock"));
+                let command_args = args(&[command, flag, "", "--action", "focus", "title"]);
+                let error = execute_command(&mut client, &default_opts(command_args))
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!("{flag} requires a non-empty value"),
+                    "{command}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn host_binary_candidates_cover_installed_and_dev_layouts() {
         let installed = Path::new("/usr/bin/limux");
         let candidates = host_binary_candidates(installed);
@@ -3868,6 +4488,44 @@ mod cli_arg_tests {
     }
 
     #[test]
+    fn cleanup_scope_uses_current_target_and_can_fall_back_to_stable_tab_or_payload() {
+        let payload = json!({"workspace_id": "payload-workspace", "surface_id": "5:payload-tab"});
+        let current = |key: &str| match key {
+            "LIMUX_WORKSPACE_ID" => Some("current-workspace".into()),
+            "LIMUX_SURFACE_ID" => Some("7:current-tab".into()),
+            "LIMUX_TAB_ID" => Some("stable-tab".into()),
+            _ => None,
+        };
+        assert_eq!(
+            agent_hook_cleanup_scope(
+                &args(&["--workspace", "explicit", "--surface", "8:explicit-tab"]),
+                &payload,
+                current
+            ),
+            (Some("explicit".into()), Some("8:explicit-tab".into()))
+        );
+        assert_eq!(
+            agent_hook_cleanup_scope(&[], &payload, current),
+            (
+                Some("current-workspace".into()),
+                Some("7:current-tab".into())
+            )
+        );
+        assert_eq!(
+            agent_hook_cleanup_scope(&[], &json!({}), |key| (key == "LIMUX_TAB_ID")
+                .then(|| "stable-tab".into())),
+            (None, Some("stable-tab".into()))
+        );
+        assert_eq!(
+            agent_hook_cleanup_scope(&[], &payload, |_| None),
+            (
+                Some("payload-workspace".into()),
+                Some("5:payload-tab".into())
+            )
+        );
+    }
+
+    #[test]
     fn default_hook_setup_omits_opencode_until_supported() {
         assert_eq!(
             default_hook_targets(),
@@ -3942,6 +4600,7 @@ mod cli_arg_tests {
         install_json_hooks(
             &path,
             agent_hooks::AgentKind::Claude,
+            false,
             &[("SessionStart", "session-start")],
         )
         .expect("install hooks");
@@ -3958,6 +4617,47 @@ mod cli_arg_tests {
     }
 
     #[test]
+    fn osc_hook_install_is_explicit_idempotent_and_preserves_other_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let original = json!({"custom": 42, "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo independent"}]}]}});
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        for _ in 0..2 {
+            install_json_hooks(
+                &path,
+                agent_hooks::AgentKind::Codex,
+                true,
+                &[("Stop", "stop")],
+            )
+            .unwrap();
+        }
+        let config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(config["custom"], 42);
+        let stop = config["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2);
+        assert_eq!(stop[0], original["hooks"]["Stop"][0]);
+        assert!(stop[1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("env LIMUX_NOTIFY_OSC=1"));
+        install_json_hooks(
+            &path,
+            agent_hooks::AgentKind::Codex,
+            false,
+            &[("Stop", "stop")],
+        )
+        .unwrap();
+        assert!(!fs::read_to_string(&path)
+            .unwrap()
+            .contains("LIMUX_NOTIFY_OSC"));
+        uninstall_json_hooks(&path, agent_hooks::AgentKind::Codex).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap(),
+            original
+        );
+    }
+
+    #[test]
     fn codex_hook_install_keeps_codex_schema_without_matcher() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("hooks.json");
@@ -3965,6 +4665,7 @@ mod cli_arg_tests {
         install_json_hooks(
             &path,
             agent_hooks::AgentKind::Codex,
+            false,
             &[("SessionStart", "session-start")],
         )
         .expect("install hooks");
@@ -4032,6 +4733,62 @@ mod cli_arg_tests {
 #[cfg(test)]
 mod agent_team_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dry_run_previews_instructions_without_creating_or_overwriting_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        let args = vec![
+            "--dry-run".to_string(),
+            "--cwd".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        ];
+        let mut client = Client::new(dir.path().join("absent.sock"));
+        let preview = run_agent_team(&mut client, &args).await.unwrap();
+        assert!(preview["agents_md_preview"]
+            .as_str()
+            .unwrap()
+            .contains("<agent-msg"));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let original = "# Existing project instructions\nNever discard these.\n";
+        fs::write(&path, original).unwrap();
+        run_agent_team(&mut client, &args).await.unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn existing_instructions_fail_before_contacting_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        fs::write(&path, "User policies").unwrap();
+        let args = vec![
+            "--cwd".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        ];
+        let mut client = Client::new(dir.path().join("absent.sock"));
+        let error = run_agent_team(&mut client, &args).await.unwrap_err();
+        assert!(error.to_string().contains("refusing to replace"));
+        assert_eq!(client.seq, 0);
+        assert_eq!(fs::read_to_string(path).unwrap(), "User policies");
+    }
+
+    #[tokio::test]
+    async fn invalid_destination_fails_before_contacting_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = vec![
+            "--cwd".to_string(),
+            dir.path()
+                .join("missing-directory")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        let mut client = Client::new(dir.path().join("absent.sock"));
+        let error = run_agent_team(&mut client, &args).await.unwrap_err();
+        assert!(error.to_string().contains("could not resolve cwd"));
+        assert_eq!(client.seq, 0);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn agent_launch_known() {
@@ -4109,6 +4866,62 @@ mod agent_team_tests {
 }
 
 #[cfg(test)]
+mod request_workspace_tests {
+    use super::request_workspace;
+
+    fn env(name: &str) -> Option<String> {
+        (name == "LIMUX_WORKSPACE_ID").then(|| "ws-env".to_string())
+    }
+
+    #[test]
+    fn env_workspace_scopes_only_requests_without_a_surface() {
+        assert_eq!(
+            request_workspace(None, None, env).as_deref(),
+            Some("ws-env")
+        );
+        assert_eq!(request_workspace(None, Some("7:tab-a"), env), None);
+        assert_eq!(
+            request_workspace(Some("ws-flag".to_string()), Some("7:tab-a"), env).as_deref(),
+            Some("ws-flag")
+        );
+        assert_eq!(request_workspace(None, None, |_| None), None);
+    }
+
+    #[test]
+    fn an_empty_explicit_workspace_means_unscoped() {
+        for explicit in ["", " "] {
+            assert_eq!(
+                request_workspace(Some(explicit.to_string()), None, env),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_notification_from_a_surface_is_unscoped() {
+        let env = |name: &str| match name {
+            "LIMUX_WORKSPACE_ID" => Some("ws-env".to_string()),
+            "LIMUX_TAB_ID" => Some("tab-a".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            super::notification_scope(&[], env),
+            (None, Some("tab-a".to_string()))
+        );
+        assert_eq!(
+            super::notification_scope(&["--workspace".to_string(), "ws-flag".to_string()], env),
+            (Some("ws-flag".to_string()), Some("tab-a".to_string()))
+        );
+        assert_eq!(
+            super::notification_scope(&[], |name: &str| {
+                (name == "LIMUX_WORKSPACE_ID").then(|| "ws-env".to_string())
+            }),
+            (Some("ws-env".to_string()), None)
+        );
+    }
+}
+
+#[cfg(test)]
 mod new_pane_tests {
     use super::*;
 
@@ -4126,10 +4939,277 @@ mod new_pane_tests {
     }
 
     #[test]
+    fn set_workspace_color_uses_env_workspace_and_passes_color_through() {
+        let params = build_set_workspace_color_params(&args(&["blue"]), test_env).unwrap();
+
+        assert_eq!(
+            params,
+            json!({ "color": "blue", "workspace_id": "workspace:agent" })
+        );
+    }
+
+    #[test]
+    fn set_workspace_color_flag_overrides_env_workspace() {
+        let params = build_set_workspace_color_params(
+            &args(&["--workspace", "raw-workspace", "none"]),
+            test_env,
+        )
+        .unwrap();
+
+        assert_eq!(
+            params,
+            json!({ "color": "none", "workspace_id": "raw-workspace" })
+        );
+    }
+
+    #[test]
+    fn set_workspace_color_without_env_targets_the_active_workspace() {
+        let params = build_set_workspace_color_params(&args(&["teal"]), |_| None).unwrap();
+
+        assert_eq!(params, json!({ "color": "teal" }));
+    }
+
+    #[test]
+    fn set_workspace_color_requires_a_color() {
+        let error =
+            build_set_workspace_color_params(&args(&["--workspace", "raw-workspace"]), test_env)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("requires a color"));
+    }
+
+    #[test]
+    fn group_commands_build_their_socket_requests() {
+        let cases = [
+            (vec!["list-groups"], "workspace.group_list", json!({})),
+            (
+                vec![
+                    "create-group",
+                    "--color",
+                    "teal",
+                    "--workspace",
+                    "workspace:1",
+                    "--workspace",
+                    "2",
+                    "Back",
+                    "end",
+                ],
+                "workspace.group_create",
+                json!({ "name": "Back end", "color": "teal", "workspace_ids": ["workspace:1", "2"] }),
+            ),
+            (vec!["create-group"], "workspace.group_create", json!({})),
+            (
+                vec!["rename-group", "--group", "group:abc", "Ops"],
+                "workspace.group_rename",
+                json!({ "group_id": "group:abc", "name": "Ops" }),
+            ),
+            (
+                vec!["set-group-color", "--group", "Ops", "red"],
+                "workspace.group_set_color",
+                json!({ "group_id": "Ops", "color": "red" }),
+            ),
+            (
+                vec!["collapse-group", "--group", "abc"],
+                "workspace.group_set_collapsed",
+                json!({ "group_id": "abc", "collapsed": true }),
+            ),
+            (
+                vec!["expand-group", "--group", "abc"],
+                "workspace.group_set_collapsed",
+                json!({ "group_id": "abc", "collapsed": false }),
+            ),
+            (
+                vec!["delete-group", "--group", "abc"],
+                "workspace.group_delete",
+                json!({ "group_id": "abc" }),
+            ),
+            (
+                vec!["set-workspace-group", "Ops"],
+                "workspace.set_group",
+                json!({ "group_id": "Ops", "workspace_id": "workspace:agent" }),
+            ),
+            (
+                vec!["set-workspace-group", "--workspace", "raw", "None"],
+                "workspace.set_group",
+                json!({ "group_id": null, "workspace_id": "raw" }),
+            ),
+        ];
+        for (argv, method, params) in cases {
+            let (command, rest) = argv.split_first().unwrap();
+            assert_eq!(
+                build_group_request(command, &args(rest), test_env).unwrap(),
+                (method, params),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_commands_require_their_arguments() {
+        for (argv, message) in [
+            (vec!["rename-group", "Ops"], "requires --group"),
+            (vec!["rename-group", "--group", "abc"], "requires a name"),
+            (
+                vec!["set-group-color", "--group", "abc"],
+                "requires a color",
+            ),
+            (vec!["delete-group"], "requires --group"),
+            (vec!["collapse-group", "--group", " "], "requires --group"),
+            (vec!["set-workspace-group"], "or \"none\" to ungroup"),
+        ] {
+            let (command, rest) = argv.split_first().unwrap();
+            let error = build_group_request(command, &args(rest), test_env).unwrap_err();
+            assert!(error.to_string().contains(message), "{argv:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn gui_hooks_commands_build_their_socket_requests() {
+        let cases = [
+            (vec!["list"], "gui_hook.list", json!({})),
+            (
+                vec![
+                    "set",
+                    "on-workspace-create",
+                    "--command",
+                    "~/bin/new.sh --force",
+                    "--show-terminal",
+                    "--no-suppress-default",
+                ],
+                "gui_hook.set",
+                json!({
+                    "event": "on-workspace-create",
+                    "command": "~/bin/new.sh --force",
+                    "show_terminal": true,
+                    "suppress_default": false,
+                }),
+            ),
+            (
+                vec!["set", "on-workspace-delete", "--suppress-default"],
+                "gui_hook.set",
+                json!({ "event": "on-workspace-delete", "suppress_default": true }),
+            ),
+            (
+                vec!["set", "on-workspace-delete", "--disable"],
+                "gui_hook.set",
+                json!({ "event": "on-workspace-delete", "enabled": false }),
+            ),
+            (
+                vec![
+                    "set",
+                    "after-workspace-create",
+                    "--command",
+                    "notify-send created",
+                    "--show-terminal",
+                ],
+                "gui_hook.set",
+                json!({
+                    "event": "after-workspace-create",
+                    "command": "notify-send created",
+                    "show_terminal": true,
+                }),
+            ),
+            (
+                vec!["disable", "after-workspace-delete"],
+                "gui_hook.set",
+                json!({ "event": "after-workspace-delete", "enabled": false }),
+            ),
+            (
+                vec!["disable", "on-workspace-create"],
+                "gui_hook.set",
+                json!({ "event": "on-workspace-create", "enabled": false }),
+            ),
+            (
+                vec!["enable", "on-workspace-create"],
+                "gui_hook.set",
+                json!({ "event": "on-workspace-create", "enabled": true }),
+            ),
+            (
+                vec!["clear", "on-workspace-delete"],
+                "gui_hook.clear",
+                json!({ "event": "on-workspace-delete" }),
+            ),
+        ];
+        for (argv, method, params) in cases {
+            assert_eq!(
+                build_gui_hooks_request(&args(&argv)).unwrap(),
+                (method, params),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gui_hooks_commands_reject_incomplete_arguments() {
+        for (argv, message) in [
+            (vec![], "usage"),
+            (vec!["remove"], "unknown gui-hooks subcommand"),
+            (vec!["set", "--show-terminal"], "requires an event"),
+            (vec!["set", "on-workspace-create"], "requires --command"),
+            (
+                vec!["set", "on-workspace-create", "--command"],
+                "requires the command",
+            ),
+            (
+                vec![
+                    "set",
+                    "on-workspace-create",
+                    "--show-terminal",
+                    "--no-show-terminal",
+                ],
+                "cannot be combined",
+            ),
+            (
+                vec!["set", "on-workspace-create", "--enable", "--disable"],
+                "cannot be combined",
+            ),
+            (vec!["disable"], "requires an event"),
+            (vec!["clear"], "requires an event"),
+        ] {
+            let error = build_gui_hooks_request(&args(&argv)).unwrap_err();
+            assert!(error.to_string().contains(message), "{argv:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn gui_hooks_render_one_line_per_hook() {
+        let payload = json!({ "hooks": [
+            { "event": "on-workspace-create", "configured": true, "command": "new.sh -y", "show_terminal": true, "suppress_default": true },
+            { "event": "after-workspace-create", "configured": true, "enabled": true, "command": "notify-send created", "show_terminal": false, "suppress_default": false },
+            { "event": "on-workspace-delete", "configured": false, "command": "", "show_terminal": false, "suppress_default": false },
+        ]});
+        assert_eq!(
+            render_gui_hooks(&payload),
+            "on-workspace-create: new.sh -y (in a terminal, default action skipped)\n\
+             after-workspace-create: notify-send created (in the background)\n\
+             on-workspace-delete: not set"
+        );
+        let disabled = json!({ "event": "on-workspace-delete", "configured": true, "enabled": false, "command": "rm.sh", "show_terminal": false, "suppress_default": false });
+        assert_eq!(
+            render_gui_hooks(&disabled),
+            "on-workspace-delete: rm.sh (disabled, in the background)"
+        );
+    }
+
+    #[test]
+    fn group_list_renders_one_line_per_group() {
+        let payload = json!({ "groups": [
+            { "ref": "group:a", "name": "Backend", "color": "blue", "collapsed": false, "workspace_ids": ["1", "2"] },
+            { "ref": "group:b", "name": "Docs", "color": "teal", "collapsed": true, "workspace_ids": ["3"] },
+        ]});
+        assert_eq!(
+            render_group_list(&payload),
+            "group:a Backend (blue, 2 workspaces)\ngroup:b Docs (teal, 1 workspace, collapsed)"
+        );
+        assert_eq!(render_group_list(&json!({ "groups": [] })), "No groups");
+    }
+
+    #[test]
     fn new_pane_serializes_env_defaults_and_command() {
         let (workspace, params) = build_new_pane_request(&args(&["--command", "claude"]), test_env);
 
-        assert_eq!(workspace.as_deref(), Some("workspace:agent"));
+        // The caller's surface leads; its workspace may be stale after a move.
+        assert_eq!(workspace, None);
         assert_eq!(
             params,
             json!({

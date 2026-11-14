@@ -1,11 +1,14 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File, TryLockError};
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const STORE_LOCK_RETRY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +88,16 @@ struct AgentHookSessionFile {
     version: u32,
     #[serde(default)]
     sessions: BTreeMap<String, AgentHookSessionRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ended_sessions: Vec<EndedAgentHookSession>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct EndedAgentHookSession {
+    session_id: String,
+    workspace_id: String,
+    surface_id: String,
+    updated_at: f64,
 }
 
 pub(crate) struct AgentHookSessionStore {
@@ -116,7 +129,8 @@ impl AgentHookSessionStore {
         }
     }
 
-    pub(crate) fn lookup(&self, session_id: &str) -> Result<Option<AgentHookSessionRecord>> {
+    #[cfg(test)]
+    fn lookup(&self, session_id: &str) -> Result<Option<AgentHookSessionRecord>> {
         let session_id = normalized(session_id);
         if session_id.is_none() {
             return Ok(None);
@@ -125,23 +139,99 @@ impl AgentHookSessionStore {
         Ok(file.sessions.get(session_id.as_deref().unwrap()).cloned())
     }
 
-    pub(crate) fn upsert(&self, record: AgentHookSessionRecord) -> Result<()> {
-        let Some(session_id) = normalized(&record.session_id) else {
+    pub(crate) fn update(
+        &self,
+        session_id: &str,
+        update: impl FnOnce(Option<&AgentHookSessionRecord>) -> AgentHookSessionRecord,
+    ) -> Result<()> {
+        let Some(session_id) = normalized(session_id) else {
             return Ok(());
         };
+        let _lock = self.lock()?;
         let mut file = self.load()?;
+        let record = update(file.sessions.get(&session_id));
+        file.ended_sessions.retain(|ended| {
+            ended.session_id != session_id
+                || tab_identity(&ended.surface_id) != tab_identity(&record.surface_id)
+        });
         file.version = 1;
         file.sessions.insert(session_id, record);
         self.save(&file)
     }
 
-    pub(crate) fn remove(&self, session_id: &str) -> Result<()> {
+    pub(crate) fn remove(
+        &self,
+        session_id: &str,
+        workspace_id: Option<&str>,
+        surface_id: Option<&str>,
+    ) -> Result<()> {
         let Some(session_id) = normalized(session_id) else {
             return Ok(());
         };
+        let _lock = self.lock()?;
         let mut file = self.load()?;
-        file.sessions.remove(&session_id);
+        let removed = file.sessions.remove(&session_id);
+        let surface_id = surface_id.and_then(normalized).or_else(|| {
+            removed
+                .as_ref()
+                .and_then(|record| normalized(&record.surface_id))
+        });
+        if let Some(surface_id) = surface_id {
+            file.ended_sessions.retain(|ended| {
+                ended.session_id != session_id
+                    || tab_identity(&ended.surface_id) != tab_identity(&surface_id)
+            });
+            file.ended_sessions.push(EndedAgentHookSession {
+                session_id,
+                workspace_id: workspace_id
+                    .and_then(normalized)
+                    .or_else(|| {
+                        removed
+                            .as_ref()
+                            .and_then(|record| normalized(&record.workspace_id))
+                    })
+                    .unwrap_or_default(),
+                surface_id,
+                updated_at: now_seconds(),
+            });
+        }
         self.save(&file)
+    }
+
+    fn lock(&self) -> Result<File> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        // Keep a stable sibling inode: the JSON is replaced by rename, and
+        // unlinking the lock file would let another writer lock a different inode.
+        let lock_path = self.path.with_extension("lock");
+        let lock = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open {}", lock_path.display()))?;
+        let deadline = Instant::now() + STORE_LOCK_TIMEOUT;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => return Ok(lock),
+                Err(TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        bail!(
+                            "timed out acquiring hook store lock {}",
+                            lock_path.display()
+                        );
+                    }
+                    std::thread::sleep(STORE_LOCK_RETRY);
+                }
+                Err(TryLockError::Error(error)) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to lock {}", lock_path.display()));
+                }
+            }
+        }
     }
 
     fn load(&self) -> Result<AgentHookSessionFile> {
@@ -149,6 +239,7 @@ impl AgentHookSessionStore {
             return Ok(AgentHookSessionFile {
                 version: 1,
                 sessions: BTreeMap::new(),
+                ended_sessions: Vec::new(),
             });
         }
         let raw = fs::read_to_string(&self.path)
@@ -175,6 +266,11 @@ impl AgentHookSessionStore {
             .with_context(|| format!("failed to replace {}", self.path.display()))?;
         Ok(())
     }
+}
+
+fn tab_identity(surface_id: &str) -> &str {
+    let surface_id = surface_id.trim();
+    surface_id.rsplit(':').next().unwrap_or(surface_id)
 }
 
 pub(crate) fn sanitize_launch_arguments(kind: AgentKind, arguments: &[String]) -> Vec<String> {
@@ -489,12 +585,217 @@ mod tests {
             updated_at: 11.0,
         };
 
-        store.upsert(record.clone()).expect("upsert");
+        store
+            .update(&record.session_id, |_| record.clone())
+            .expect("update");
 
         assert_eq!(
             store.lookup("codex-session-1").expect("lookup"),
             Some(record)
         );
+    }
+
+    fn test_record(session_id: &str) -> AgentHookSessionRecord {
+        AgentHookSessionRecord {
+            session_id: session_id.to_string(),
+            workspace_id: "workspace".to_string(),
+            surface_id: format!("1:{session_id}"),
+            cwd: Some("/fresh-cwd".to_string()),
+            pid: None,
+            launch_command: None,
+            updated_at: now_seconds(),
+        }
+    }
+
+    #[test]
+    fn cleanup_durably_invalidates_the_removed_binding() {
+        let dir = tempdir().unwrap();
+        let store = AgentHookSessionStore::new_for_dir("codex", dir.path());
+        store.update("ended", |_| test_record("ended")).unwrap();
+        store.remove("ended", None, None).unwrap();
+        assert!(store.lookup("ended").unwrap().is_none());
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+        assert_eq!(json["ended_sessions"][0]["session_id"], "ended");
+        assert_eq!(json["ended_sessions"][0]["surface_id"], "1:ended");
+    }
+
+    #[test]
+    fn cleanup_without_a_record_keeps_scoped_invalidations_until_matching_upsert() {
+        let dir = tempdir().unwrap();
+        let store = AgentHookSessionStore::new_for_dir("codex", dir.path());
+        store
+            .remove("ended", Some("old-workspace"), Some("1:tab-a"))
+            .unwrap();
+        store
+            .remove("ended", Some("other-workspace"), Some("2:tab-b"))
+            .unwrap();
+        store
+            .remove("other", Some("old-workspace"), Some("1:tab-a"))
+            .unwrap();
+        let persisted = AgentHookSessionStore::new_for_dir("codex", dir.path());
+        assert_eq!(persisted.load().unwrap().ended_sessions.len(), 3);
+
+        // Restarting the same tab clears its cleanup after a pane/workspace
+        // change, while other sessions and tabs keep their cleanup markers.
+        persisted
+            .update("ended", |_| {
+                let mut record = test_record("ended");
+                record.workspace_id = "new-workspace".into();
+                record.surface_id = "99:tab-a".into();
+                record
+            })
+            .unwrap();
+        let ended = persisted.load().unwrap().ended_sessions;
+        assert_eq!(ended.len(), 2);
+        assert!(ended
+            .iter()
+            .any(|record| record.session_id == "ended" && record.surface_id == "2:tab-b"));
+        assert!(ended.iter().any(|record| record.session_id == "other"));
+    }
+
+    fn await_marker(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    struct Worker(std::process::Child);
+
+    impl Worker {
+        fn start(dir: &Path, action: &str) -> Self {
+            Self(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "agent_hooks::tests::hook_store_process_worker",
+                        "--nocapture",
+                    ])
+                    .env("LIMUX_HOOK_TEST_DIR", dir)
+                    .env("LIMUX_HOOK_TEST_ACTION", action)
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        fn finish(&mut self) {
+            assert!(self.0.wait().unwrap().success());
+        }
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // Run in separate processes so these tests exercise OS lock semantics,
+    // including descriptor release on termination, rather than a thread mutex.
+    #[test]
+    fn hook_store_process_worker() {
+        let Ok(dir) = std::env::var("LIMUX_HOOK_TEST_DIR") else {
+            return;
+        };
+        let dir = Path::new(&dir);
+        let action = std::env::var("LIMUX_HOOK_TEST_ACTION").unwrap();
+        let store = AgentHookSessionStore::new_for_dir("codex", dir);
+        if action == "hold" {
+            store
+                .update("first", |_| {
+                    fs::write(dir.join("held"), "").unwrap();
+                    await_marker(&dir.join("release"));
+                    test_record("first")
+                })
+                .unwrap();
+            return;
+        }
+
+        // The first worker has entered its merge closure. Verify it actually
+        // holds the kernel lock before allowing the parent to release it.
+        let probe = File::options()
+            .read(true)
+            .write(true)
+            .open(store.path.with_extension("lock"))
+            .unwrap();
+        assert!(matches!(probe.try_lock(), Err(TryLockError::WouldBlock)));
+        fs::write(dir.join("contended"), "").unwrap();
+        match action.as_str() {
+            "insert" => store.update("second", |_| test_record("second")).unwrap(),
+            "merge" => store
+                .update("first", |existing| {
+                    let mut record = existing.expect("must see committed first update").clone();
+                    assert_eq!(record.cwd.as_deref(), Some("/fresh-cwd"));
+                    record.pid = Some(42);
+                    record
+                })
+                .unwrap(),
+            "remove" => store.remove("remove-me", None, None).unwrap(),
+            _ => panic!("unknown worker action"),
+        }
+    }
+
+    #[test]
+    fn concurrent_process_transactions_preserve_sessions_merges_and_cleanup() {
+        for action in ["insert", "merge", "remove"] {
+            let dir = tempdir().unwrap();
+            let store = AgentHookSessionStore::new_for_dir("codex", dir.path());
+            store
+                .update("remove-me", |_| test_record("remove-me"))
+                .unwrap();
+            let mut first = Worker::start(dir.path(), "hold");
+            await_marker(&dir.path().join("held"));
+            let mut second = Worker::start(dir.path(), action);
+            await_marker(&dir.path().join("contended"));
+            fs::write(dir.path().join("release"), "").unwrap();
+            first.finish();
+            second.finish();
+
+            let first = store.lookup("first").unwrap().unwrap();
+            assert_eq!(first.cwd.as_deref(), Some("/fresh-cwd"));
+            match action {
+                "insert" => assert!(store.lookup("second").unwrap().is_some()),
+                "merge" => assert_eq!(first.pid, Some(42)),
+                "remove" => assert!(store.lookup("remove-me").unwrap().is_none()),
+                _ => unreachable!(),
+            }
+            if action != "remove" {
+                assert!(store.lookup("remove-me").unwrap().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn killed_writer_releases_lock_without_deleting_lock_file() {
+        let dir = tempdir().unwrap();
+        let store = AgentHookSessionStore::new_for_dir("codex", dir.path());
+        let mut holder = Worker::start(dir.path(), "hold");
+        await_marker(&dir.path().join("held"));
+        holder.0.kill().unwrap();
+        holder.0.wait().unwrap();
+        assert!(store.path.with_extension("lock").exists());
+        store.update("next", |_| test_record("next")).unwrap();
+        assert!(store.lookup("next").unwrap().is_some());
+    }
+
+    #[test]
+    fn lock_timeout_does_not_modify_session_store() {
+        let dir = tempdir().unwrap();
+        let store = AgentHookSessionStore::new_for_dir("codex", dir.path());
+        store.update("saved", |_| test_record("saved")).unwrap();
+        let before = fs::read(&store.path).unwrap();
+        let _holder = Worker::start(dir.path(), "hold");
+        await_marker(&dir.path().join("held"));
+        let result = store.update("blocked", |_| panic!("must not merge without lock"));
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert_eq!(fs::read(&store.path).unwrap(), before);
     }
 
     #[test]

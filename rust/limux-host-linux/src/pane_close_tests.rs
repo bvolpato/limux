@@ -1,0 +1,838 @@
+use super::*;
+
+use crate::layout_state::{SplitOrientation, SplitState};
+
+fn pump_until(timeout: std::time::Duration, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !done() && std::time::Instant::now() < deadline {
+        while glib::MainContext::default().pending() {
+            glib::MainContext::default().iteration(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn pump_for(duration: std::time::Duration) {
+    pump_until(duration, || false);
+}
+
+/// `root` and every widget below it.
+fn widget_tree(root: &gtk::Widget) -> Vec<gtk::Widget> {
+    let mut widgets = vec![root.clone()];
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        widgets.extend(widget_tree(&widget));
+        child = widget.next_sibling();
+    }
+    widgets
+}
+
+fn weak_refs(widgets: &[gtk::Widget]) -> Vec<glib::WeakRef<gtk::Widget>> {
+    widgets.iter().map(|widget| widget.downgrade()).collect()
+}
+
+fn survivors(refs: &[glib::WeakRef<gtk::Widget>]) -> Vec<&'static str> {
+    refs.iter()
+        .filter_map(|weak| weak.upgrade())
+        .map(|widget| widget.type_().name())
+        .collect()
+}
+
+fn assert_freed(what: &str, refs: &[glib::WeakRef<gtk::Widget>]) {
+    pump_until(std::time::Duration::from_secs(5), || {
+        survivors(refs).is_empty()
+    });
+    let alive = survivors(refs);
+    assert!(
+        alive.is_empty(),
+        "{what}: {} of {} widgets still alive: {alive:?}",
+        alive.len(),
+        refs.len()
+    );
+}
+
+fn focus_within(state: &State, widget: &gtk::Widget) -> bool {
+    let window = state.borrow().window.clone();
+    gtk::prelude::GtkWindowExt::focus(&window)
+        .is_some_and(|focus| &focus == widget || focus.is_ancestor(widget))
+}
+
+fn assert_focus_within(what: &str, state: &State, widget: &gtk::Widget) {
+    pump_until(std::time::Duration::from_secs(5), || {
+        focus_within(state, widget)
+    });
+    let window = state.borrow().window.clone();
+    let focus = gtk::prelude::GtkWindowExt::focus(&window);
+    assert!(
+        focus_within(state, widget),
+        "{what}: the focus is on {:?}",
+        focus.map(|focus| focus.type_().name())
+    );
+}
+
+fn shown(widget: &gtk::Widget) -> bool {
+    widget.is_mapped() && widget.width() > 0
+}
+
+/// Right-clicks `widget` and returns the menu it opens.
+fn open_context_menu(widget: &gtk::Widget) -> gtk::Popover {
+    let controllers = widget.observe_controllers();
+    let right_click = (0..controllers.n_items())
+        .filter_map(|i| controllers.item(i).and_downcast::<gtk::GestureClick>())
+        .find(|gesture| gesture.button() == 3)
+        .expect("a right-click gesture");
+    right_click.emit_by_name::<()>("pressed", &[&1i32, &10.0f64, &10.0f64]);
+    widget
+        .last_child()
+        .and_downcast::<gtk::Popover>()
+        .expect("a context menu")
+}
+
+fn menu_item(menu: &gtk::Popover, label: &str) -> gtk::Button {
+    widget_tree(menu.upcast_ref())
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+        .find(|button| button.label().is_some_and(|text| text == label))
+        .unwrap_or_else(|| panic!("a {label:?} menu item"))
+}
+
+/// Focuses the menu item labelled `label`, as pressing it does.
+fn focus_menu_item(menu: &gtk::Popover, label: &str) -> gtk::Button {
+    let item = menu_item(menu, label);
+    assert!(item.grab_focus());
+    item
+}
+
+fn split_options() -> SplitPaneOptions {
+    SplitPaneOptions {
+        initial_state: None,
+        skip_default_tab: false,
+        inherit_active_directory: false,
+        new_pane_first: false,
+        persist: false,
+        suppress_initial_autostart: false,
+    }
+}
+
+/// Adds a workspace, shows it, focuses its last pane, and returns its id and
+/// root.
+fn show_focused_workspace(state: &State, layout: LayoutNodeState) -> (String, gtk::Widget) {
+    add_workspace_from_state(
+        state,
+        &WorkspaceState {
+            color: None,
+            group_id: None,
+            id: None,
+            name: "closed".to_string(),
+            favorite: false,
+            cwd: None,
+            folder_path: None,
+            autostart_command: None,
+            layout,
+        },
+    );
+    let (index, ws_id, root) = {
+        let s = state.borrow();
+        let index = s.workspaces.len() - 1;
+        let ws = &s.workspaces[index];
+        (index, ws.id.clone(), ws.root.clone())
+    };
+    select_workspace_by_index(state, index);
+    let panes = || {
+        let mut panes = Vec::new();
+        for start in [true, false] {
+            let pane = find_leaf_pane(&root, gtk::Orientation::Horizontal, start);
+            if !panes.contains(&pane) {
+                panes.push(pane);
+            }
+        }
+        panes
+    };
+    pump_until(std::time::Duration::from_secs(5), || {
+        panes().iter().all(shown)
+    });
+    let last = panes().pop().unwrap();
+    assert!(shown(&last), "workspace panes never showed");
+    assert!(pane::focus_active_tab_in_pane(&last));
+    pump_for(std::time::Duration::from_millis(200));
+    assert!(focus_within(state, &root), "the workspace has the focus");
+    (ws_id, root)
+}
+
+// Issue #202: a closed pane stayed alive for the life of the process, held by
+// its own handlers. With the focus inside, GTK 4.22 also kept what was closed
+// (see `terminal::unset_focus_within`), so every close here starts focused.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn closed_tabs_panes_and_workspaces_free_their_widgets() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.PaneCloseTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let wait = std::time::Duration::from_secs(5);
+    let (ws_id, first) = {
+        let s = state.borrow();
+        let ws = s.active_workspace().unwrap();
+        let first = find_leaf_pane(&ws.root, gtk::Orientation::Horizontal, true);
+        (ws.id.clone(), first)
+    };
+    pump_until(wait, || shown(&first));
+
+    // A tab closed with another one left to replace it.
+    pane::add_terminal_tab_to_pane(&first);
+    assert!(pane::focus_active_tab_in_pane(&first));
+    pump_for(std::time::Duration::from_millis(200));
+    let before = widget_tree(&first);
+    let tab_id = pane::active_tab_in_pane(&first).unwrap();
+    assert!(pane::close_tab_in_pane(&first, &tab_id));
+    // Its content leaves the stack after a frame.
+    pump_for(std::time::Duration::from_millis(500));
+    let kept = widget_tree(&first);
+    let closed_tab: Vec<_> = before.into_iter().filter(|w| !kept.contains(w)).collect();
+    assert!(
+        closed_tab.iter().any(|w| w.is::<gtk::GLArea>()),
+        "the tab's terminal left the pane"
+    );
+    let refs = weak_refs(&closed_tab);
+    drop((closed_tab, kept));
+    assert_freed("closed tab", &refs);
+
+    // A pane closed through its only tab, as typing `exit` does.
+    let lone = split_pane(
+        &state,
+        &ws_id,
+        &first,
+        gtk::Orientation::Horizontal,
+        split_options(),
+    )
+    .expect("split");
+    pump_until(wait, || shown(&lone));
+    assert!(pane::focus_active_tab_in_pane(&lone));
+    pump_for(std::time::Duration::from_millis(200));
+    let refs = weak_refs(&widget_tree(&lone));
+    let tab_id = pane::active_tab_in_pane(&lone).unwrap();
+    assert!(pane::close_tab_in_pane(&lone, &tab_id));
+    drop(lone);
+    assert_freed("pane closed by its last tab", &refs);
+    assert_focus_within("pane closed by its last tab", &state, &first);
+
+    // A pane with two terminal tabs and the keybinds tab, whose tab and
+    // terminal menus were used and whose tab is being renamed, closed as its
+    // close button does.
+    let closed = split_pane(
+        &state,
+        &ws_id,
+        &first,
+        gtk::Orientation::Horizontal,
+        split_options(),
+    )
+    .expect("split");
+    let shortcuts = state.borrow().shortcuts.clone();
+    pane::add_keybind_editor_tab_to_pane(&closed, shortcuts, Rc::new(|_, _| Err(String::new())));
+    pane::add_terminal_tab_to_pane(&closed);
+    pump_until(wait, || shown(&closed));
+    assert!(shown(&closed), "split pane never showed");
+    assert_eq!(pane::tab_count_in_pane(&closed), 3);
+    assert!(pane::focus_active_tab_in_pane(&closed));
+    pump_for(std::time::Duration::from_millis(200));
+
+    let terminal = widget_tree(&closed)
+        .into_iter()
+        .find(|w| w.is::<gtk::GLArea>() && w.is_mapped())
+        .expect("the active terminal");
+    // A synthetic right-click has no seat/grab under headless Weston, so the
+    // production entry point correctly detaches its refused popup immediately.
+    // Build the same menu with the real terminal callbacks and retain it here
+    // to exercise focus restoration and lifetime cleanup on close. Refused
+    // popup detachment has its own terminal regression.
+    let terminal_menu = pane::terminal_handle_for_surface(&closed, None)
+        .expect("the active terminal handle")
+        .1
+        .build_context_menu_for_test();
+    terminal_menu.popup();
+    focus_menu_item(&terminal_menu, "Paste");
+    menu_item(&terminal_menu, "Copy Surface ID").emit_clicked();
+    assert!(terminal_menu.parent().is_none(), "the terminal menu closed");
+    let toast = widget_tree(&closed)
+        .into_iter()
+        .find(|widget| widget.has_css_class("limux-toast"))
+        .expect("copying the surface ID showed a toast")
+        .downgrade();
+    assert!(
+        focus_within(&state, &terminal),
+        "the terminal menu gives the focus back to its terminal as it closes"
+    );
+
+    let tab = widget_tree(&closed)
+        .into_iter()
+        .find(|w| w.has_css_class("limux-tab"))
+        .expect("a tab button");
+    let pin_menu = open_context_menu(&tab);
+    focus_menu_item(&pin_menu, "Pin").emit_clicked();
+    assert!(pin_menu.parent().is_none(), "the tab menu closed");
+    assert_focus_within("tab menu closed", &state, &closed);
+    let tab_menu = open_context_menu(&tab);
+    focus_menu_item(&tab_menu, "Rename").emit_clicked();
+    assert!(tab_menu.parent().is_none(), "the tab menu closed");
+    pump_until(wait, || pane::find_tab_rename_entry(&closed).is_some());
+    assert!(
+        pane::find_tab_rename_entry(&closed).is_some(),
+        "a rename is open"
+    );
+
+    let mut refs = weak_refs(&widget_tree(&closed));
+    refs.push(toast);
+    refs.push(terminal_menu.upcast::<gtk::Widget>().downgrade());
+    refs.push(tab_menu.upcast::<gtk::Widget>().downgrade());
+    refs.push(pin_menu.upcast::<gtk::Widget>().downgrade());
+    drop((terminal, tab));
+    remove_pane(&state, &ws_id, &closed);
+    drop(closed);
+    assert_freed("closed pane", &refs);
+    assert_focus_within("closed pane", &state, &first);
+
+    // Two panes closed in one tick, as two shells exiting together: the
+    // focus stays where it was.
+    let doomed: Vec<_> = (0..2)
+        .map(|_| {
+            split_pane(
+                &state,
+                &ws_id,
+                &first,
+                gtk::Orientation::Horizontal,
+                split_options(),
+            )
+            .expect("split")
+        })
+        .collect();
+    pump_until(wait, || doomed.iter().all(shown));
+    assert!(pane::focus_active_tab_in_pane(&first));
+    pump_for(std::time::Duration::from_millis(200));
+    assert!(focus_within(&state, &first), "the first pane has the focus");
+    let refs = weak_refs(&doomed.iter().flat_map(widget_tree).collect::<Vec<_>>());
+    for pane in &doomed {
+        remove_pane(&state, &ws_id, pane);
+    }
+    drop(doomed);
+    assert_freed("two panes closed in one tick", &refs);
+    assert_focus_within("two panes closed in one tick", &state, &first);
+
+    // Workspaces: split, then single-pane, closed directly and through the
+    // last terminal's tab. The focus goes back to where it was in the
+    // workspace shown instead: `other`, not its first pane.
+    let other = split_pane(
+        &state,
+        &ws_id,
+        &first,
+        gtk::Orientation::Horizontal,
+        split_options(),
+    )
+    .expect("split");
+    pump_until(wait, || shown(&other));
+    assert!(pane::focus_active_tab_in_pane(&other));
+    pump_for(std::time::Duration::from_millis(200));
+    drop(first);
+    let split = LayoutNodeState::Split(SplitState {
+        orientation: SplitOrientation::Horizontal,
+        ratio: 0.5,
+        start: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+        end: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+    });
+    let single = || LayoutNodeState::Pane(PaneState::fallback(None));
+    for (what, layout, by_last_tab) in [
+        ("closed split workspace", split, false),
+        ("closed single-pane workspace", single(), false),
+        ("workspace closed by its last tab", single(), true),
+    ] {
+        let (ws_id, root) = show_focused_workspace(&state, layout);
+        let refs = weak_refs(&widget_tree(&root));
+        if by_last_tab {
+            let pane = find_leaf_pane(&root, gtk::Orientation::Horizontal, true);
+            let tab_id = pane::active_tab_in_pane(&pane).unwrap();
+            assert!(pane::close_tab_in_pane(&pane, &tab_id));
+        } else {
+            close_workspace_by_id(&state, &ws_id);
+        }
+        drop(root);
+        assert_freed(what, &refs);
+        assert_focus_within(what, &state, &other);
+    }
+
+    // A workspace kept open after its last terminal exits: the pane stays,
+    // the terminal goes although it had the focus.
+    state
+        .borrow()
+        .config
+        .borrow_mut()
+        .workspace
+        .keep_open_after_last_terminal_closes = true;
+    let (_, root) = show_focused_workspace(&state, single());
+    let kept_pane = find_leaf_pane(&root, gtk::Orientation::Horizontal, true);
+    let before = widget_tree(&kept_pane);
+    let tab_id = pane::active_tab_in_pane(&kept_pane).unwrap();
+    assert!(pane::close_tab_in_pane(&kept_pane, &tab_id));
+    pump_for(std::time::Duration::from_millis(500));
+    assert!(kept_pane.parent().is_some(), "the pane was kept");
+    let kept = widget_tree(&kept_pane);
+    let closed_tab: Vec<_> = before.into_iter().filter(|w| !kept.contains(w)).collect();
+    assert!(
+        closed_tab.iter().any(|w| w.is::<gtk::GLArea>()),
+        "the terminal left the kept pane"
+    );
+    let refs = weak_refs(&closed_tab);
+    drop((closed_tab, kept, kept_pane, root));
+    assert_freed("terminal of a kept-open workspace", &refs);
+
+    let window = state.borrow().window.clone();
+    window.close();
+}
+
+fn registered_panes() -> Vec<gtk::Widget> {
+    (0..1000).filter_map(pane::find_pane_widget_by_id).collect()
+}
+
+/// Splits `first` with a new pane before it, shows both and focuses the new
+/// one, so closing it closes the first leaf of the tree.
+fn split_before(state: &State, ws_id: &str, first: &gtk::Widget) -> gtk::Widget {
+    let lead = split_pane(
+        state,
+        ws_id,
+        first,
+        gtk::Orientation::Horizontal,
+        SplitPaneOptions {
+            new_pane_first: true,
+            ..split_options()
+        },
+    )
+    .expect("split");
+    pump_until(std::time::Duration::from_secs(5), || {
+        shown(&lead) && shown(first)
+    });
+    assert!(shown(&lead) && shown(first), "split panes never showed");
+    assert!(pane::focus_active_tab_in_pane(&lead));
+    pump_for(std::time::Duration::from_millis(200));
+    lead
+}
+
+// A zoom or split within one frame of a pane close used to target the closed
+// pane: the old widget tree stays in the workspace until the next frame, and
+// its first leaf was found when the focus sat in no pane.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn zoom_and_split_within_a_frame_of_a_close_skip_the_closed_pane() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.PaneCloseZoomSplitTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let wait = std::time::Duration::from_secs(5);
+    let (ws_id, first, container) = {
+        let s = state.borrow();
+        let ws = s.active_workspace().unwrap();
+        let first = find_leaf_pane(&ws.root, gtk::Orientation::Horizontal, true);
+        (ws.id.clone(), first, ws.split_container.clone())
+    };
+    pump_until(wait, || shown(&first));
+
+    // Zoom right after the first leaf closed.
+    let lead = split_before(&state, &ws_id, &first);
+    remove_pane(&state, &ws_id, &lead);
+    toggle_focused_pane_zoom(&state);
+    pump_until(wait, || shown(&first));
+    assert!(shown(&first), "the zoom left the workspace blank");
+    assert!(!container.contains(&lead), "the closed pane is in the tree");
+    toggle_focused_pane_zoom(&state);
+    pump_for(std::time::Duration::from_millis(300));
+    drop(lead);
+
+    // Directional lookups skip it too.
+    let lead = split_before(&state, &ws_id, &first);
+    remove_pane(&state, &ws_id, &lead);
+    assert!(
+        pane_in_direction(&state, &first, Direction::Left).is_none(),
+        "found the closed pane"
+    );
+    drop(lead);
+    pump_for(std::time::Duration::from_millis(300));
+
+    // A split of the closed pane itself builds nothing.
+    let lead = split_before(&state, &ws_id, &first);
+    remove_pane(&state, &ws_id, &lead);
+    let before = registered_panes().len();
+    assert!(
+        split_pane(
+            &state,
+            &ws_id,
+            &lead,
+            gtk::Orientation::Horizontal,
+            split_options()
+        )
+        .is_none(),
+        "split a closed pane"
+    );
+    assert_eq!(registered_panes().len(), before, "an orphaned pane");
+    drop(lead);
+    pump_for(std::time::Duration::from_millis(300));
+
+    // Split right after the first leaf closed.
+    let lead = split_before(&state, &ws_id, &first);
+    remove_pane(&state, &ws_id, &lead);
+    let before = registered_panes().len();
+    split_focused_pane(&state, gtk::Orientation::Horizontal);
+    pump_for(std::time::Duration::from_millis(500));
+    let panes = registered_panes();
+    assert_eq!(panes.len(), before + 1, "the split built one pane");
+    assert!(
+        panes.iter().all(shown),
+        "a registered pane is not in the tree"
+    );
+
+    let window = state.borrow().window.clone();
+    window.close();
+}
+
+// The workspace menu's items held their own popover, a cycle that kept it and
+// its row parent chain alive after every use. The headless compositor has no
+// seat, so the popover is never presented nor closed: detach it by hand, as
+// its `closed` handler would, and require that nothing else retains it.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn workspace_context_menu_never_retains_its_popover() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.WorkspaceMenuTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let row = state.borrow().workspaces[0].sidebar_row.clone();
+    pump_for(std::time::Duration::from_millis(200));
+
+    let menu = open_context_menu(row.upcast_ref());
+    menu_item(&menu, "Rename").emit_clicked();
+    let refs = vec![menu.clone().upcast::<gtk::Widget>().downgrade()];
+    menu.unparent();
+    drop(menu);
+    assert_freed("workspace context menu", &refs);
+}
+
+// Starts an inline rename with the focus in a terminal and commits it with
+// Enter, as a user would: the entry is removed while it holds the focus, so
+// unless the commit moves the focus first, GTK hands it to the next focusable
+// widget in the row, the star button.
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn inline_rename_commit_returns_the_focus_to_the_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.InlineRenameFocusTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+
+    begin_workspace_inline_rename(&state, &ws_id);
+    let sidebar_list = state.borrow().sidebar_list.clone();
+    let entry = find_active_rename_entry(&sidebar_list).expect("rename entry");
+    assert_focus_within("rename started", &state, entry.upcast_ref());
+
+    entry.set_text("renamed");
+    entry.emit_activate();
+    assert_focus_within("rename committed", &state, &root);
+    {
+        let s = state.borrow();
+        let ws = s.workspaces.iter().find(|ws| ws.id == ws_id).unwrap();
+        assert_eq!(ws.name, "renamed");
+    }
+    assert!(find_active_rename_entry(&sidebar_list).is_none());
+
+    // A click on a terminal commits the rename on press (the window's
+    // capture-phase `click_anywhere`), then the terminal takes the focus. The
+    // commit must leave it there, not pull it to the workspace's first pane.
+    let split = LayoutNodeState::Split(SplitState {
+        orientation: SplitOrientation::Horizontal,
+        ratio: 0.5,
+        start: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+        end: Box::new(LayoutNodeState::Pane(PaneState::fallback(None))),
+    });
+    let (ws_id, root) = show_focused_workspace(&state, split);
+    let clicked = find_leaf_pane(&root, gtk::Orientation::Horizontal, false);
+    begin_workspace_inline_rename(&state, &ws_id);
+    let entry = find_active_rename_entry(&sidebar_list).expect("rename entry");
+    assert_focus_within("split rename started", &state, entry.upcast_ref());
+    entry.emit_activate();
+    assert!(find_gl_area(&clicked).expect("terminal").grab_focus());
+    pump_for(std::time::Duration::from_millis(200));
+    assert_focus_within("rename committed by a click", &state, &clicked);
+}
+
+#[test]
+#[ignore = "requires an active X11 window and Ghostty resources"]
+fn passive_rename_focus_restore_preserves_manual_tab_unread() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+    let socket = temp.path().join("limux.sock");
+    std::env::set_var("LIMUX_SOCKET", &socket);
+    std::env::set_var("LIMUX_SOCKET_PATH", &socket);
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.UnreadFocusRestoreTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let pane = first_leaf_pane(&root);
+    let tab_id = pane::active_tab_in_pane(&pane).unwrap();
+    let (window, row, sidebar_list) = {
+        let s = state.borrow();
+        let ws = s.workspaces.iter().find(|ws| ws.id == ws_id).unwrap();
+        (
+            s.window.clone(),
+            ws.sidebar_row.clone(),
+            s.sidebar_list.clone(),
+        )
+    };
+    let wait = std::time::Duration::from_secs(5);
+    pump_until(wait, || window.is_active());
+    assert!(window.is_active(), "Limux must start active");
+    assert!(pane::mark_active_tab_manual_unread_in_root(&root));
+    sync_workspace_unread(&state, &ws_id);
+
+    let menu = open_context_menu(row.upcast_ref());
+    menu_item(&menu, "Rename").emit_clicked();
+    pump_until(wait, || find_active_rename_entry(&sidebar_list).is_some());
+    let entry = find_active_rename_entry(&sidebar_list).expect("rename entry");
+    assert_focus_within("rename started", &state, entry.upcast_ref());
+    entry.set_text("renamed while inactive");
+
+    let peer = adw::ApplicationWindow::builder()
+        .application(&app)
+        .title("Focus peer")
+        .build();
+    peer.present();
+    pump_until(wait, || peer.is_active() && !window.is_active());
+    assert!(peer.is_active() && !window.is_active());
+    assert!(find_active_rename_entry(&sidebar_list).is_none());
+    assert!(state.borrow().pending_focus_restore.is_some());
+    assert!(pane::workspace_has_unread_tabs(&ws_id));
+    assert_eq!(
+        state.borrow().active_workspace().unwrap().name,
+        entry.text()
+    );
+
+    window.present();
+    pump_until(wait, || window.is_active());
+    assert!(window.is_active());
+    assert_focus_within("passive activation restores terminal focus", &state, &pane);
+    assert!(state.borrow().pending_focus_restore.is_none());
+    assert!(
+        pane::workspace_has_unread_tabs(&ws_id),
+        "passive rename focus restoration must preserve a manual tab marker"
+    );
+    assert!(pane::activate_tab_in_pane(&pane, &tab_id));
+    assert!(
+        !pane::workspace_has_unread_tabs(&ws_id),
+        "explicit tab activation still acknowledges its marker"
+    );
+    peer.close();
+    window.close();
+}
+
+#[test]
+#[ignore = "requires a graphical display and Ghostty resources"]
+fn tab_unread_changes_preserve_independent_workspace_notifications() {
+    let temp = tempfile::tempdir().unwrap();
+    for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let path = temp.path().join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var(key, path);
+    }
+    let ghostty_config = temp.path().join("XDG_CONFIG_HOME/ghostty");
+    std::fs::create_dir_all(&ghostty_config).unwrap();
+    std::fs::write(
+        ghostty_config.join("config"),
+        "command = /bin/sh\nshell-integration = none\n",
+    )
+    .unwrap();
+    let socket = temp.path().join("limux.sock");
+    std::env::set_var("LIMUX_SOCKET", &socket);
+    std::env::set_var("LIMUX_SOCKET_PATH", &socket);
+
+    crate::prepare_ghostty_runtime();
+    adw::init().unwrap();
+    crate::terminal::init_ghostty();
+    let app = adw::Application::builder()
+        .application_id("dev.limux.UnreadSourcesTest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    build_window(&app);
+    let state = CONTROL_STATE.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    let (ws_id, root) =
+        show_focused_workspace(&state, LayoutNodeState::Pane(PaneState::fallback(None)));
+    let pane = first_leaf_pane(&root);
+    pane::add_terminal_tab_to_pane(&pane);
+    let surface = pane::active_surface_summary(&pane).unwrap();
+    let (_, handle) = pane::terminal_handle_for_surface(&pane, Some(&surface.surface_id)).unwrap();
+    let wait = std::time::Duration::from_secs(5);
+    pump_until(wait, || handle.health().realized);
+    assert!(handle.health().realized);
+    select_workspace_by_index(&state, 0);
+
+    let target = DesktopNotificationTarget {
+        workspace_id: ws_id.clone(),
+        pane_id: None,
+        tab_id: None,
+    };
+    mark_workspace_unread_with_message(&state, &ws_id, "Workspace notice", false, target);
+    let target = DesktopNotificationTarget {
+        workspace_id: ws_id.clone(),
+        pane_id: Some(surface.pane_id),
+        tab_id: Some(surface.tab_id.clone()),
+    };
+    mark_workspace_unread_with_message(&state, &ws_id, "Tab notice", false, target);
+    assert!(pane::workspace_has_unread_tabs(&ws_id));
+    assert!(handle.send_text("exit\n"));
+    pump_until(wait, || pane::tab_count_in_pane(&pane) == 1);
+    assert_eq!(pane::tab_count_in_pane(&pane), 1, "unread terminal exited");
+    let (row, notify_dot) = {
+        let s = state.borrow();
+        let workspace = s.workspaces.iter().find(|w| w.id == ws_id).unwrap();
+        assert!(
+            workspace.unread,
+            "a terminal exit must preserve the independent workspace notice"
+        );
+        (
+            workspace.sidebar_row.clone(),
+            workspace.indicator_unread_dot.clone(),
+        )
+    };
+    assert!(!pane::workspace_has_unread_tabs(&ws_id));
+    assert!(notify_dot.get_visible());
+
+    let menu = open_context_menu(row.upcast_ref());
+    menu_item(&menu, "Mark as Read").emit_clicked();
+    pump_until(wait, || !notify_dot.get_visible());
+    assert!(!notify_dot.get_visible());
+    let index = state
+        .borrow()
+        .workspaces
+        .iter()
+        .position(|w| w.id == ws_id)
+        .unwrap();
+    select_workspace_by_index(&state, index);
+    pane::add_terminal_tab_to_pane(&pane);
+    assert!(pane::mark_active_tab_manual_unread_in_root(&root));
+    sync_workspace_unread(&state, &ws_id);
+    assert!(pane::workspace_has_unread_tabs(&ws_id));
+    assert!(notify_dot.get_visible());
+    assert!(!pane::clear_active_tab_unread_in_root_if_not_manual(&root));
+    assert!(pane::workspace_has_unread_tabs(&ws_id));
+    let menu = open_context_menu(row.upcast_ref());
+    menu_item(&menu, "Mark as Read").emit_clicked();
+    pump_until(wait, || !pane::workspace_has_unread_tabs(&ws_id));
+    assert!(!pane::workspace_has_unread_tabs(&ws_id));
+    assert!(
+        !notify_dot.get_visible(),
+        "reading a tab-only notice clears it"
+    );
+
+    let menu = open_context_menu(row.upcast_ref());
+    menu_item(&menu, "Mark as Unread").emit_clicked();
+    pump_until(wait, || notify_dot.get_visible());
+    {
+        let s = state.borrow();
+        let workspace = s.workspaces.iter().find(|w| w.id == ws_id).unwrap();
+        assert!(workspace.manual_unread);
+        assert!(
+            !workspace.unread,
+            "manual and notification sources are separate"
+        );
+    }
+    let surface = pane::active_surface_summary(&pane).unwrap();
+    let (_, handle) = pane::terminal_handle_for_surface(&pane, Some(&surface.surface_id)).unwrap();
+    pump_until(wait, || handle.health().realized);
+    assert!(handle.send_text("exit\n"));
+    pump_until(wait, || pane::tab_count_in_pane(&pane) == 1);
+    assert_eq!(pane::tab_count_in_pane(&pane), 1);
+    assert!(
+        state.borrow().workspaces[index].manual_unread,
+        "a terminal exit must preserve the independent manual workspace reminder"
+    );
+    assert!(notify_dot.get_visible());
+    let menu = open_context_menu(row.upcast_ref());
+    menu_item(&menu, "Mark as Read").emit_clicked();
+    pump_until(wait, || !notify_dot.get_visible());
+    assert!(!notify_dot.get_visible());
+    assert!(!pane::workspace_has_unread_tabs(&ws_id));
+
+    pane::add_terminal_tab_to_pane(&pane);
+    let tab_id = pane::active_tab_in_pane(&pane).unwrap();
+    let pane_id = pane::active_surface_summary(&pane).unwrap().pane_id;
+    assert_eq!(
+        pane::mark_tab_unread_in_workspace(&ws_id, pane_id, &tab_id),
+        Some(true)
+    );
+    sync_workspace_unread(&state, &ws_id);
+    assert!(notify_dot.get_visible());
+    assert!(pane::close_tab_in_pane(&pane, &tab_id));
+    assert!(!pane::workspace_has_unread_tabs(&ws_id));
+    assert!(
+        !notify_dot.get_visible(),
+        "closing a tab-only notice clears it"
+    );
+
+    let window = state.borrow().window.clone();
+    window.close();
+    pump_until(wait, || !window.is_visible());
+}

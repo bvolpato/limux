@@ -15,15 +15,27 @@ use limux_control::socket_path::{bind_listener, resolve_socket_path, SocketMode}
 use limux_protocol::{parse_v1_command_envelope, V2Request, V2Response};
 use serde_json::{json, Map, Value};
 
+use crate::gui_hooks::{GuiHookEvent, GuiHookUpdate};
+use crate::workspace_color::WorkspaceColor;
+
 const METHODS: &[&str] = &[
     "system.ping",
     "system.identify",
     "system.capabilities",
+    "window.activate",
     "workspace.current",
     "workspace.list",
     "workspace.create",
     "workspace.select",
     "workspace.rename",
+    "workspace.set_color",
+    "workspace.set_group",
+    "workspace.group_list",
+    "workspace.group_create",
+    "workspace.group_rename",
+    "workspace.group_set_color",
+    "workspace.group_set_collapsed",
+    "workspace.group_delete",
     "workspace.close",
     "pane.list",
     "pane.surfaces",
@@ -33,7 +45,15 @@ const METHODS: &[&str] = &[
     "surface.read_text",
     "surface.send_text",
     "surface.send_key",
+    "surface.create",
+    "surface.close",
+    "surface.focus",
+    "pane.focus",
+    "tab.action",
     "notification.create",
+    "gui_hook.list",
+    "gui_hook.set",
+    "gui_hook.clear",
 ];
 
 const PARSE_ERROR_CODE: i64 = -32700;
@@ -51,6 +71,51 @@ pub enum WorkspaceTarget {
     Handle(String),
     Name(String),
     Index(usize),
+}
+
+/// A sidebar workspace group request. A group is named by id (the `group:`
+/// prefix is optional) or by its exact name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GroupRequest {
+    List,
+    Create {
+        name: Option<String>,
+        color: Option<WorkspaceColor>,
+        workspaces: Vec<WorkspaceTarget>,
+    },
+    Rename {
+        group: String,
+        name: String,
+    },
+    SetColor {
+        group: String,
+        color: WorkspaceColor,
+    },
+    SetCollapsed {
+        group: String,
+        collapsed: bool,
+    },
+    Delete {
+        group: String,
+    },
+    /// Move a workspace into a group, or out of its group with `None`.
+    SetWorkspaceGroup {
+        target: WorkspaceTarget,
+        group: Option<String>,
+    },
+}
+
+/// Read or change the GUI hooks in the app settings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GuiHookRequest {
+    List,
+    Set {
+        event: GuiHookEvent,
+        update: GuiHookUpdate,
+    },
+    Clear {
+        event: GuiHookEvent,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +168,10 @@ pub enum ControlCommand {
         caller: Option<Value>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    ActivateWindow {
+        activation_token: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     CurrentWorkspace {
         reply: mpsc::Sender<BridgeResult>,
     },
@@ -151,8 +220,21 @@ pub enum ControlCommand {
         title: String,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SetWorkspaceColor {
+        target: WorkspaceTarget,
+        color: Option<WorkspaceColor>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     CloseWorkspace {
         target: WorkspaceTarget,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    WorkspaceGroup {
+        request: GroupRequest,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    GuiHook {
+        request: GuiHookRequest,
         reply: mpsc::Sender<BridgeResult>,
     },
     SendText {
@@ -165,6 +247,40 @@ pub enum ControlCommand {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
         key: String,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    /// Open a new tab (surface) inside an existing pane.
+    CreateSurface {
+        target: WorkspaceTarget,
+        pane_hint: Option<String>,
+        browser: bool,
+        url: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    /// Close a single surface (tab). The only sub-workspace teardown there is.
+    CloseSurface {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    /// Make a surface the active tab of its pane.
+    FocusSurface {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    /// Move keyboard focus to a pane.
+    FocusPane {
+        target: WorkspaceTarget,
+        pane_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    /// Act on a tab: `rename`, `pin`, `unpin`, `close`, `select`.
+    TabAction {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        action: String,
+        title: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
     /// Post a desktop-style notification into the sidebar + toast overlay.
@@ -183,6 +299,7 @@ impl ControlCommand {
     pub fn respond(self, result: BridgeResult) {
         match self {
             Self::Identify { reply, .. }
+            | Self::ActivateWindow { reply, .. }
             | Self::CurrentWorkspace { reply }
             | Self::ListWorkspaces { reply }
             | Self::ListPanes { reply, .. }
@@ -194,9 +311,17 @@ impl ControlCommand {
             | Self::CreateWorkspace { reply, .. }
             | Self::SelectWorkspace { reply, .. }
             | Self::RenameWorkspace { reply, .. }
+            | Self::SetWorkspaceColor { reply, .. }
             | Self::CloseWorkspace { reply, .. }
+            | Self::WorkspaceGroup { reply, .. }
+            | Self::GuiHook { reply, .. }
             | Self::SendText { reply, .. }
             | Self::SendKey { reply, .. }
+            | Self::CreateSurface { reply, .. }
+            | Self::CloseSurface { reply, .. }
+            | Self::FocusSurface { reply, .. }
+            | Self::FocusPane { reply, .. }
+            | Self::TabAction { reply, .. }
             | Self::CreateNotification { reply, .. } => {
                 let _ = reply.send(result);
             }
@@ -308,6 +433,25 @@ fn optional_handle(
     Ok(None)
 }
 
+/// A supplied terminal target must remain explicit, including malformed empty
+/// handles. Dropping it would redirect input to the active or first terminal.
+fn optional_surface_handle(
+    params: &Map<String, Value>,
+    keys: &[&str],
+) -> Result<Option<String>, BridgeError> {
+    for key in keys {
+        if params.get(*key).is_none_or(Value::is_null) {
+            continue;
+        }
+        let handle = optional_ref_handle(params, &[*key], "surface:")?;
+        return handle
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| Some(value.trim().to_string()))
+            .ok_or_else(|| BridgeError::invalid_params(format!("{key} must not be empty")));
+    }
+    Ok(None)
+}
+
 fn optional_ref_handle(
     params: &Map<String, Value>,
     keys: &[&str],
@@ -335,6 +479,114 @@ fn optional_index(params: &Map<String, Value>, key: &str) -> Result<Option<usize
     Err(BridgeError::invalid_params(format!(
         "{key} must be a non-negative integer"
     )))
+}
+
+fn optional_explicit_handle(
+    params: &Map<String, Value>,
+    keys: &[&str],
+    prefix: &str,
+) -> Result<Option<String>, BridgeError> {
+    let mut selected = None;
+    for key in keys {
+        if !params.contains_key(*key) {
+            continue;
+        }
+        let handle = optional_ref_handle(params, &[*key], prefix)?
+            .filter(|handle| !handle.trim().is_empty())
+            .ok_or_else(|| {
+                BridgeError::invalid_params(format!("{key} must not be empty or null"))
+            })?;
+        if selected.is_none() {
+            selected = Some(handle);
+        }
+    }
+    Ok(selected)
+}
+
+fn parse_lifecycle_workspace_target(
+    params: &Map<String, Value>,
+) -> Result<WorkspaceTarget, BridgeError> {
+    optional_explicit_handle(params, &["workspace_id", "id"], "workspace:")?;
+    if let Some(name) = params.get("name") {
+        if name.as_str().is_none_or(|name| name.trim().is_empty()) {
+            return Err(BridgeError::invalid_params(
+                "name must be a non-empty string",
+            ));
+        }
+    }
+    optional_index(params, "index")?;
+    parse_optional_workspace_target(params, true)
+}
+
+fn optional_tab_handle(params: &Map<String, Value>) -> Result<Option<String>, BridgeError> {
+    let mut selected = None;
+    for key in ["surface_id", "tab_id"] {
+        if let Some(handle) = optional_explicit_handle(params, &[key], "surface:")? {
+            let handle = handle.strip_prefix("tab:").unwrap_or(&handle).trim();
+            if handle.is_empty() {
+                return Err(BridgeError::invalid_params(format!(
+                    "{key} must not be empty"
+                )));
+            }
+            if selected.is_none() {
+                selected = Some(handle.to_string());
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn parse_surface_kind(params: &Map<String, Value>) -> Result<(bool, Option<String>), BridgeError> {
+    let mut browser = None;
+    for key in ["type", "kind"] {
+        let Some(value) = params.get(key) else {
+            continue;
+        };
+        let parsed = match value.as_str().map(str::to_ascii_lowercase).as_deref() {
+            Some("terminal") => false,
+            Some("browser") => true,
+            _ => {
+                return Err(BridgeError::invalid_params(format!(
+                    "{key} must be terminal or browser"
+                )))
+            }
+        };
+        if browser.is_some_and(|previous| previous != parsed) {
+            return Err(BridgeError::invalid_params("type and kind must agree"));
+        }
+        browser = Some(parsed);
+    }
+    let url = params
+        .get("url")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| BridgeError::invalid_params("url must be a non-empty string"))
+        })
+        .transpose()?;
+    if browser == Some(false) && url.is_some() {
+        return Err(BridgeError::invalid_params(
+            "url requires a browser surface",
+        ));
+    }
+    if let Some(url) = &url {
+        if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+            return Err(BridgeError::invalid_params(
+                "url must be an absolute URI without control characters",
+            ));
+        }
+        let uri = glib::Uri::parse(url, glib::UriFlags::NONE)
+            .map_err(|_| BridgeError::invalid_params("url must be an absolute URI"))?;
+        if matches!(uri.scheme().as_str(), "http" | "https")
+            && uri.host().is_none_or(|host| host.is_empty())
+        {
+            return Err(BridgeError::invalid_params("url must be an absolute URI"));
+        }
+    }
+    Ok((browser.unwrap_or(url.is_some()), url))
 }
 
 fn looks_like_workspace_handle(raw: &str) -> bool {
@@ -367,7 +619,217 @@ fn parse_optional_workspace_target(
     Ok(WorkspaceTarget::Active)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+/// Read the `color` param of `workspace.set_color`: a palette name, or
+/// `"none"` / `null` to clear the colour.
+fn parse_workspace_color(
+    params: &Map<String, Value>,
+) -> Result<Option<WorkspaceColor>, BridgeError> {
+    parse_color_param(params, "workspace.set_color", true)
+}
+
+/// Read a palette colour param; `allow_none` also accepts `"none"` / `null`.
+fn parse_color_param(
+    params: &Map<String, Value>,
+    method: &str,
+    allow_none: bool,
+) -> Result<Option<WorkspaceColor>, BridgeError> {
+    let name = match params.get("color") {
+        None => {
+            return Err(BridgeError::invalid_params(format!(
+                "{method} requires color"
+            )))
+        }
+        Some(Value::Null) if allow_none => return Ok(None),
+        Some(Value::String(name)) => name.trim(),
+        Some(_) if allow_none => {
+            return Err(BridgeError::invalid_params(format!(
+                "{method} color must be a string or null"
+            )))
+        }
+        Some(_) => {
+            return Err(BridgeError::invalid_params(format!(
+                "{method} color must be a string"
+            )))
+        }
+    };
+    if allow_none && name.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    WorkspaceColor::from_name(name).map(Some).ok_or_else(|| {
+        BridgeError::invalid_params(format!(
+            "unknown color {name:?}; expected one of: {}{}",
+            crate::workspace_color::color_names(),
+            if allow_none { ", none" } else { "" },
+        ))
+    })
+}
+
+fn required_group(params: &Map<String, Value>, method: &str) -> Result<String, BridgeError> {
+    optional_ref_handle(params, &["group_id", "group"], "group:")?
+        .ok_or_else(|| BridgeError::invalid_params(format!("{method} requires group_id")))
+}
+
+fn parse_group_request(
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<GroupRequest, BridgeError> {
+    match method {
+        "workspace.group_list" => Ok(GroupRequest::List),
+        "workspace.group_create" => {
+            let name = match params.get("name") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(name)) if !name.trim().is_empty() => {
+                    Some(name.trim().to_string())
+                }
+                Some(_) => {
+                    return Err(BridgeError::invalid_params(
+                        "workspace.group_create name must be a non-empty string",
+                    ))
+                }
+            };
+            let color = if params.get("color").is_none_or(Value::is_null) {
+                None
+            } else {
+                parse_color_param(params, method, false)?
+            };
+            let mut workspaces = Vec::new();
+            if let Some(handle) = optional_handle(params, &["workspace_id"])? {
+                workspaces.push(WorkspaceTarget::Handle(handle));
+            }
+            match params.get("workspace_ids") {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(handles)) => {
+                    for handle in handles {
+                        let handle = match handle {
+                            Value::String(raw) if !raw.trim().is_empty() => raw.trim().to_string(),
+                            Value::Number(number) if number.is_u64() => number.to_string(),
+                            _ => {
+                                return Err(BridgeError::invalid_params(
+                                    "workspace_ids must hold workspace handles",
+                                ))
+                            }
+                        };
+                        workspaces.push(WorkspaceTarget::Handle(handle));
+                    }
+                }
+                Some(_) => {
+                    return Err(BridgeError::invalid_params(
+                        "workspace_ids must be an array of workspace handles",
+                    ))
+                }
+            }
+            Ok(GroupRequest::Create {
+                name,
+                color,
+                workspaces,
+            })
+        }
+        "workspace.group_rename" => {
+            let group = required_group(params, method)?;
+            let name = optional_string(params, &["name", "title"]).ok_or_else(|| {
+                BridgeError::invalid_params("workspace.group_rename requires name")
+            })?;
+            Ok(GroupRequest::Rename { group, name })
+        }
+        "workspace.group_set_color" => {
+            let group = required_group(params, method)?;
+            let color = parse_color_param(params, method, false)?
+                .expect("a colour is required without allow_none");
+            Ok(GroupRequest::SetColor { group, color })
+        }
+        "workspace.group_set_collapsed" => {
+            let group = required_group(params, method)?;
+            let collapsed = params
+                .get("collapsed")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    BridgeError::invalid_params(
+                        "workspace.group_set_collapsed requires boolean collapsed",
+                    )
+                })?;
+            Ok(GroupRequest::SetCollapsed { group, collapsed })
+        }
+        "workspace.group_delete" => Ok(GroupRequest::Delete {
+            group: required_group(params, method)?,
+        }),
+        "workspace.set_group" => {
+            let group = match params.get("group_id").or_else(|| params.get("group")) {
+                None => {
+                    return Err(BridgeError::invalid_params(
+                        "workspace.set_group requires group_id or group (null to ungroup)",
+                    ))
+                }
+                Some(Value::Null) => None,
+                Some(_) => Some(required_group(params, method)?),
+            };
+            let target = parse_optional_workspace_target(params, false)?;
+            Ok(GroupRequest::SetWorkspaceGroup { target, group })
+        }
+        _ => Err(BridgeError::new(
+            UNKNOWN_METHOD_CODE,
+            format!("unknown group method {method}"),
+        )),
+    }
+}
+
+fn parse_gui_hook_request(
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<GuiHookRequest, BridgeError> {
+    if method == "gui_hook.list" {
+        return Ok(GuiHookRequest::List);
+    }
+    let raw_event = optional_string(params, &["event", "hook"])
+        .ok_or_else(|| BridgeError::invalid_params(format!("{method} requires event")))?;
+    let event = GuiHookEvent::parse(&raw_event).ok_or_else(|| {
+        let known: Vec<&str> = GuiHookEvent::ALL
+            .iter()
+            .map(|event| event.as_str())
+            .collect();
+        BridgeError::invalid_params(format!(
+            "unknown hook event `{raw_event}` (expected {})",
+            known.join(" or ")
+        ))
+    })?;
+    if method == "gui_hook.clear" {
+        return Ok(GuiHookRequest::Clear { event });
+    }
+    let flag = |key: &str| match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(BridgeError::invalid_params(format!(
+            "{method} {key} must be a boolean"
+        ))),
+    };
+    let command = match params.get("command") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(command)) if !command.trim().is_empty() => Some(command.clone()),
+        Some(_) => {
+            return Err(BridgeError::invalid_params(format!(
+                "{method} command must be a non-empty string"
+            )))
+        }
+    };
+    let update = GuiHookUpdate {
+        enabled: flag("enabled")?,
+        command,
+        show_terminal: flag("show_terminal")?,
+        suppress_default: flag("suppress_default")?,
+    };
+    if update.suppress_default.is_some() && !event.can_skip_default() {
+        return Err(BridgeError::invalid_params(format!(
+            "the {} hook runs after Limux's action, so it cannot skip it",
+            event.as_str()
+        )));
+    }
+    if update == GuiHookUpdate::default() {
+        return Err(BridgeError::invalid_params(format!(
+            "{method} requires enabled, command, show_terminal or suppress_default"
+        )));
+    }
+    Ok(GuiHookRequest::Set { event, update })
+}
+
 fn parse_create_pane_request(
     params: &Map<String, Value>,
 ) -> Result<CreatePaneRequest, BridgeError> {
@@ -461,6 +923,30 @@ fn handle_method(
                 rx,
             )
         }
+        "window.activate" => {
+            let activation_token = match params.get("activation_token") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(token)) if !token.contains('\0') => {
+                    (!token.is_empty()).then(|| token.clone())
+                }
+                _ => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params(
+                            "activation_token must be a string without NUL characters",
+                        ),
+                    );
+                }
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::ActivateWindow {
+                    activation_token,
+                    reply,
+                },
+                rx,
+            )
+        }
         "workspace.current" => {
             let (reply, rx) = mpsc::channel();
             (ControlCommand::CurrentWorkspace { reply }, rx)
@@ -533,8 +1019,7 @@ fn handle_method(
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
             };
-            let surface_hint = match optional_ref_handle(params, &["surface_id", "id"], "surface:")
-            {
+            let surface_hint = match optional_surface_handle(params, &["surface_id", "id"]) {
                 Ok(surface_hint) => surface_hint,
                 Err(error) => return error_response(id, error),
             };
@@ -589,6 +1074,62 @@ fn handle_method(
                 rx,
             )
         }
+        "workspace.set_color" | "set-workspace-color" => {
+            let color = match parse_workspace_color(params) {
+                Ok(color) => color,
+                Err(error) => return error_response(id, error),
+            };
+            let target = match parse_optional_workspace_target(params, false) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SetWorkspaceColor {
+                    target,
+                    color,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "workspace.group_list"
+        | "list-groups"
+        | "workspace.group_create"
+        | "create-group"
+        | "workspace.group_rename"
+        | "rename-group"
+        | "workspace.group_set_color"
+        | "set-group-color"
+        | "workspace.group_set_collapsed"
+        | "workspace.group_delete"
+        | "delete-group"
+        | "workspace.set_group"
+        | "set-workspace-group" => {
+            let canonical = match method {
+                "list-groups" => "workspace.group_list",
+                "create-group" => "workspace.group_create",
+                "rename-group" => "workspace.group_rename",
+                "set-group-color" => "workspace.group_set_color",
+                "delete-group" => "workspace.group_delete",
+                "set-workspace-group" => "workspace.set_group",
+                method => method,
+            };
+            let request = match parse_group_request(canonical, params) {
+                Ok(request) => request,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::WorkspaceGroup { request, reply }, rx)
+        }
+        "gui_hook.list" | "gui_hook.set" | "gui_hook.clear" => {
+            let request = match parse_gui_hook_request(method, params) {
+                Ok(request) => request,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::GuiHook { request, reply }, rx)
+        }
         "workspace.close" | "close-workspace" => {
             let target = match parse_optional_workspace_target(params, false) {
                 Ok(target) => target,
@@ -598,7 +1139,12 @@ fn handle_method(
             (ControlCommand::CloseWorkspace { target, reply }, rx)
         }
         "surface.send_text" | "send-text" | "send" => {
-            let Some(text) = optional_string(params, &["text"]) else {
+            let Some(text) = params
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+            else {
                 return error_response(
                     id,
                     BridgeError::invalid_params("surface.send_text requires text"),
@@ -610,12 +1156,137 @@ fn handle_method(
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
             };
+            let surface_hint = match optional_surface_handle(params, &["surface_id"]) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::SendText {
                     target,
-                    surface_hint: optional_string(params, &["surface_id"]),
+                    surface_hint,
                     text,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.create" | "new-surface" => {
+            let target = match parse_lifecycle_workspace_target(params) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (browser, url) = match parse_surface_kind(params) {
+                Ok(kind) => kind,
+                Err(error) => return error_response(id, error),
+            };
+            let pane_hint = match optional_explicit_handle(params, &["pane_id"], "pane:") {
+                Ok(handle) => handle,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::CreateSurface {
+                    target,
+                    pane_hint,
+                    browser,
+                    url,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.close" | "close-surface" => {
+            let target = match parse_lifecycle_workspace_target(params) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_explicit_handle(params, &["surface_id"], "surface:") {
+                Ok(handle) => handle,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::CloseSurface {
+                    target,
+                    surface_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.focus" | "focus-surface" => {
+            let target = match parse_lifecycle_workspace_target(params) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_explicit_handle(params, &["surface_id"], "surface:") {
+                Ok(handle) => handle,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::FocusSurface {
+                    target,
+                    surface_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "pane.focus" | "focus-pane" => {
+            let target = match parse_lifecycle_workspace_target(params) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let pane_hint = match optional_explicit_handle(params, &["pane_id"], "pane:") {
+                Ok(handle) => handle,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::FocusPane {
+                    target,
+                    pane_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "tab.action" | "tab-action" => {
+            let Some(action) = optional_string(params, &["action"]) else {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("tab.action requires action"),
+                );
+            };
+            let target = match parse_lifecycle_workspace_target(params) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_tab_handle(params) {
+                Ok(handle) => handle,
+                Err(error) => return error_response(id, error),
+            };
+            let title = match params.get("title") {
+                None => None,
+                Some(Value::String(title)) if !title.contains('\0') => Some(title.clone()),
+                Some(_) => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params(
+                            "title must be a string without NUL characters",
+                        ),
+                    )
+                }
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::TabAction {
+                    target,
+                    surface_hint,
+                    action,
+                    title,
                     reply,
                 },
                 rx,
@@ -632,11 +1303,15 @@ fn handle_method(
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
             };
+            let surface_hint = match optional_surface_handle(params, &["surface_id"]) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::SendKey {
                     target,
-                    surface_hint: optional_string(params, &["surface_id"]),
+                    surface_hint,
                     key,
                     reply,
                 },
@@ -719,14 +1394,22 @@ fn handle_client(
             return Ok(());
         }
 
-        let input = std::str::from_utf8(&line_buf)
-            .map(|line| line.trim_end_matches(['\n', '\r']))
-            .unwrap_or("");
-        if input.is_empty() {
-            continue;
-        }
-
-        let response = dispatch_request(input, dispatch);
+        let response = match std::str::from_utf8(&line_buf) {
+            Ok(input) => {
+                let input = input.trim_end_matches(['\n', '\r']);
+                if input.is_empty() {
+                    continue;
+                }
+                dispatch_request(input, dispatch)
+            }
+            Err(error) => error_response(
+                None,
+                BridgeError::new(
+                    PARSE_ERROR_CODE,
+                    format!("invalid request payload: {error}"),
+                ),
+            ),
+        };
         let mut payload = serde_json::to_string(&response)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         payload.push('\n');
@@ -742,7 +1425,7 @@ struct ConnectionSlot {
 impl ConnectionSlot {
     fn try_acquire(active_connections: Arc<AtomicUsize>) -> Option<Self> {
         active_connections
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < request_io::MAX_CONNECTIONS).then_some(current + 1)
             })
             .ok()?;
@@ -807,10 +1490,15 @@ pub fn start(dispatch: fn(ControlCommand)) {
                             .spawn(move || {
                                 let _slot = slot;
                                 if let Err(error) = handle_client(stream, dispatch.as_ref()) {
-                                    eprintln!(
-                                        "limux: control connection error for pid={} uid={}: {error}",
-                                        peer.pid, peer.uid
-                                    );
+                                    if !matches!(
+                                        error.kind(),
+                                        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                                    ) {
+                                        eprintln!(
+                                            "limux: control connection error for pid={} uid={}: {error}",
+                                            peer.pid, peer.uid
+                                        );
+                                    }
                                 }
                             })
                             .ok();
@@ -827,6 +1515,7 @@ pub fn start(dispatch: fn(ControlCommand)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
 
     #[test]
     fn parses_v2_request_directly() {
@@ -842,6 +1531,136 @@ mod tests {
             .expect("v1 request should parse");
         assert_eq!(request.method, "workspace.create");
         assert_eq!(request.params["cwd"], "/tmp");
+    }
+
+    #[test]
+    fn window_activate_queues_presentation_with_an_optional_opaque_token() {
+        for (params, expected) in [
+            (json!({}), None),
+            (json!({ "activation_token": null }), None),
+            (json!({ "activation_token": "" }), None),
+            (
+                json!({ "activation_token": " opaque token " }),
+                Some(" opaque token "),
+            ),
+        ] {
+            let response = dispatch_request(
+                &json!({ "id": "activate", "method": "window.activate", "params": params })
+                    .to_string(),
+                &|command| match command {
+                    ControlCommand::ActivateWindow {
+                        activation_token,
+                        reply,
+                    } => {
+                        assert_eq!(activation_token.as_deref(), expected);
+                        reply.send(Ok(json!({ "presented": true }))).unwrap();
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                },
+            );
+            assert_eq!(response.error, None);
+            assert_eq!(response.id, Some(json!("activate")));
+            assert_eq!(response.result, Some(json!({ "presented": true })));
+        }
+    }
+
+    #[test]
+    fn window_activate_rejects_invalid_tokens_before_gtk_dispatch() {
+        for token in [json!(42), json!(true), json!({}), json!("token\0suffix")] {
+            let response = dispatch_request(
+                &json!({ "method": "window.activate", "params": { "activation_token": token } })
+                    .to_string(),
+                &|command| panic!("invalid activation token should not dispatch: {command:?}"),
+            );
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some(INVALID_PARAMS_CODE)
+            );
+        }
+    }
+
+    #[test]
+    fn send_text_preserves_whitespace_for_every_alias() {
+        for method in ["surface.send_text", "send-text", "send"] {
+            for text in ["  alpha\nbeta\t \n", "\n\t  ", "  λ 🦀 \n"] {
+                let response = dispatch_request(
+                    &json!({ "id": 1, "method": method, "params": { "text": text } }).to_string(),
+                    &|command| match command {
+                        ControlCommand::SendText {
+                            text: actual,
+                            reply,
+                            ..
+                        } => {
+                            assert_eq!(actual, text);
+                            reply.send(Ok(json!({}))).unwrap();
+                        }
+                        other => panic!("unexpected command: {other:?}"),
+                    },
+                );
+                assert_eq!(response.error, None);
+            }
+        }
+    }
+
+    #[test]
+    fn send_text_rejects_missing_empty_and_non_string_text() {
+        for params in [json!({}), json!({ "text": "" }), json!({ "text": 1 })] {
+            let response = dispatch_request(
+                &json!({ "method": "surface.send_text", "params": params }).to_string(),
+                &|command| panic!("invalid text should not dispatch: {command:?}"),
+            );
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some(INVALID_PARAMS_CODE)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_returns_parse_error_and_keeps_connection_open() {
+        let (client, server) = UnixStream::pair().expect("socket pair should open");
+        let server_task = std::thread::spawn(move || {
+            handle_client(server, &|command| {
+                panic!("ping should not dispatch a GTK command: {command:?}")
+            })
+        });
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout should set");
+        let reader_stream = client.try_clone().expect("client should clone");
+        let mut reader = io::BufReader::new(reader_stream);
+        let mut writer = client;
+
+        writer
+            .write_all(b"\xff\n{\"id\":\"after-error\",\"method\":\"system.ping\",\"params\":{}}\n")
+            .expect("requests should write");
+        writer.flush().expect("requests should flush");
+
+        let mut response_line = String::new();
+        reader
+            .read_line(&mut response_line)
+            .expect("parse error should read");
+        let response: Value =
+            serde_json::from_str(response_line.trim()).expect("response should be valid json");
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], PARSE_ERROR_CODE);
+
+        response_line.clear();
+        reader
+            .read_line(&mut response_line)
+            .expect("ping response should read");
+        let response: Value =
+            serde_json::from_str(response_line.trim()).expect("response should be valid json");
+        assert_eq!(response["id"], "after-error");
+        assert_eq!(response["result"]["pong"], true);
+
+        drop(reader);
+        drop(writer);
+        server_task
+            .join()
+            .expect("server thread should join")
+            .expect("server should stop at EOF");
     }
 
     #[test]
@@ -877,6 +1696,452 @@ mod tests {
             parse_optional_workspace_target(params.as_object().expect("object params"), true)
                 .expect("target should parse");
         assert_eq!(target, WorkspaceTarget::Handle(workspace_id.to_string()));
+    }
+
+    #[test]
+    fn lifecycle_targets_preserve_numeric_and_prefixed_handles() {
+        for (method, field) in [
+            ("surface.create", "pane_id"),
+            ("new-surface", "pane_id"),
+            ("pane.focus", "pane_id"),
+            ("focus-pane", "pane_id"),
+            ("surface.close", "surface_id"),
+            ("close-surface", "surface_id"),
+            ("surface.focus", "surface_id"),
+            ("focus-surface", "surface_id"),
+            ("tab.action", "tab_id"),
+            ("tab-action", "surface_id"),
+        ] {
+            for handle in [
+                json!(12),
+                json!(if field == "pane_id" {
+                    "pane:12"
+                } else {
+                    "surface:12"
+                }),
+            ] {
+                let mut params = json!({"workspace_id": 7, "action": "focus"});
+                params[field] = handle;
+                let response = dispatch_request(
+                    &json!({"method": method, "params": params}).to_string(),
+                    &|command| {
+                        let (target, handle, reply) = match command {
+                            ControlCommand::CreateSurface {
+                                target,
+                                pane_hint,
+                                reply,
+                                ..
+                            }
+                            | ControlCommand::FocusPane {
+                                target,
+                                pane_hint,
+                                reply,
+                            } => (target, pane_hint, reply),
+                            ControlCommand::CloseSurface {
+                                target,
+                                surface_hint,
+                                reply,
+                            }
+                            | ControlCommand::FocusSurface {
+                                target,
+                                surface_hint,
+                                reply,
+                            }
+                            | ControlCommand::TabAction {
+                                target,
+                                surface_hint,
+                                reply,
+                                ..
+                            } => (target, surface_hint, reply),
+                            other => panic!("unexpected command: {other:?}"),
+                        };
+                        assert_eq!(target, WorkspaceTarget::Handle("7".to_string()));
+                        assert_eq!(handle.as_deref(), Some("12"));
+                        reply.send(Ok(json!({}))).unwrap();
+                    },
+                );
+                assert_eq!(response.error, None, "{method}");
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_rejects_malformed_explicit_targets_before_dispatch() {
+        for (method, field) in [
+            ("surface.create", "pane_id"),
+            ("pane.focus", "pane_id"),
+            ("surface.close", "surface_id"),
+            ("surface.focus", "surface_id"),
+            ("tab.action", "surface_id"),
+            ("tab.action", "tab_id"),
+        ] {
+            for key in [field, "workspace_id", "name"] {
+                for invalid in [
+                    Value::Null,
+                    json!(""),
+                    json!(" "),
+                    json!([]),
+                    json!({}),
+                    json!(false),
+                    json!(-1),
+                    json!(1.5),
+                ] {
+                    let mut params = json!({"action": "close"});
+                    params[key] = invalid;
+                    let response = dispatch_request(
+                        &json!({"method": method, "params": params}).to_string(),
+                        &|command| panic!("invalid target reached GTK: {command:?}"),
+                    );
+                    assert_eq!(
+                        response.error.map(|error| error.code),
+                        Some(INVALID_PARAMS_CODE),
+                        "{method}: {params}"
+                    );
+                }
+            }
+        }
+        for params in [
+            json!({"surface_id": "surface:", "tab_id": "valid"}),
+            json!({"surface_id": "valid", "tab_id": []}),
+            json!({"surface_id": "valid", "tab_id": "tab:"}),
+        ] {
+            let mut params = params;
+            params["action"] = json!("close");
+            let response = dispatch_request(
+                &json!({"method": "tab.action", "params": params}).to_string(),
+                &|command| panic!("invalid alias reached GTK: {command:?}"),
+            );
+            assert_eq!(
+                response.error.map(|error| error.code),
+                Some(INVALID_PARAMS_CODE)
+            );
+        }
+    }
+
+    #[test]
+    fn tab_action_preserves_tab_refs_and_empty_titles_but_rejects_nul() {
+        for title in [
+            json!(""),
+            json!("custom"),
+            json!("bad\u{0}title"),
+            json!([]),
+            Value::Null,
+        ] {
+            let valid = title.as_str().is_some_and(|title| !title.contains('\0'));
+            let response = dispatch_request(
+                &json!({"method": "tab.action", "params": {"action": "rename", "tab_id": "tab:tab-uuid", "title": title}}).to_string(),
+                &|command| {
+                    assert!(valid, "invalid title reached GTK");
+                    match command {
+                        ControlCommand::TabAction { surface_hint, title: actual, reply, .. } => {
+                            assert_eq!(surface_hint.as_deref(), Some("tab-uuid"));
+                            assert_eq!(actual.as_deref(), title.as_str());
+                            reply.send(Ok(json!({}))).unwrap();
+                        }
+                        other => panic!("unexpected command: {other:?}"),
+                    }
+                },
+            );
+            assert_eq!(
+                response.error.map(|error| error.code),
+                (!valid).then_some(INVALID_PARAMS_CODE)
+            );
+        }
+    }
+
+    #[test]
+    fn surface_create_validates_kind_and_url_before_dispatch() {
+        for params in [
+            json!({"type": "unknown"}),
+            json!({"kind": []}),
+            json!({"type": null}),
+            json!({"type": "terminal", "kind": "browser"}),
+            json!({"url": []}),
+            json!({"url": ""}),
+            json!({"url": "not a URL"}),
+            json!({"url": "https://"}),
+            json!({"url": "https://example.com/\u{0}"}),
+            json!({"url": "https://example.com/a\nb"}),
+            json!({"type": "terminal", "url": "about:blank"}),
+        ] {
+            let response = dispatch_request(
+                &json!({"method": "surface.create", "params": params}).to_string(),
+                &|command| panic!("invalid surface creation reached GTK: {command:?}"),
+            );
+            assert_eq!(
+                response.error.map(|error| error.code),
+                Some(INVALID_PARAMS_CODE),
+                "{params}"
+            );
+        }
+        for (params, expected_browser, expected_url) in [
+            (json!({}), false, None),
+            (json!({"type": "browser"}), true, None),
+            (json!({"url": "about:blank"}), true, Some("about:blank")),
+            (
+                json!({"kind": "browser", "url": "https://example.com/"}),
+                true,
+                Some("https://example.com/"),
+            ),
+        ] {
+            let response = dispatch_request(
+                &json!({"method": "surface.create", "params": params}).to_string(),
+                &|command| match command {
+                    ControlCommand::CreateSurface {
+                        browser,
+                        url,
+                        reply,
+                        ..
+                    } => {
+                        assert_eq!(browser, expected_browser);
+                        assert_eq!(url.as_deref(), expected_url);
+                        reply.send(Ok(json!({}))).unwrap();
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                },
+            );
+            assert_eq!(response.error, None);
+        }
+    }
+
+    #[test]
+    fn workspace_set_color_parses_names_and_clears() {
+        for (color, expected) in [
+            (json!("blue"), Some(WorkspaceColor::Blue)),
+            (json!(" Pink "), Some(WorkspaceColor::Pink)),
+            (json!("none"), None),
+            (Value::Null, None),
+        ] {
+            let response = dispatch_request(
+                &json!({"method": "workspace.set_color", "params": {"color": color}}).to_string(),
+                &|command| match command {
+                    ControlCommand::SetWorkspaceColor {
+                        target,
+                        color,
+                        reply,
+                    } => {
+                        assert_eq!(target, WorkspaceTarget::Active);
+                        assert_eq!(color, expected);
+                        reply.send(Ok(json!({}))).unwrap();
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                },
+            );
+            assert_eq!(response.error, None);
+        }
+    }
+
+    #[test]
+    fn workspace_set_color_rejects_missing_and_unknown_colors() {
+        for params in [
+            json!({}),
+            json!({"color": "chartreuse"}),
+            json!({"color": 3}),
+        ] {
+            let response = dispatch_request(
+                &json!({"method": "workspace.set_color", "params": params}).to_string(),
+                &|command| panic!("unexpected command: {command:?}"),
+            );
+            let error = response.error.expect("invalid color is rejected");
+            assert_eq!(error.code, INVALID_PARAMS_CODE);
+        }
+    }
+
+    fn dispatched_group_request(method: &str, params: Value) -> GroupRequest {
+        let seen = std::cell::RefCell::new(None);
+        let response = dispatch_request(
+            &json!({"method": method, "params": params}).to_string(),
+            &|command| match command {
+                ControlCommand::WorkspaceGroup { request, reply } => {
+                    *seen.borrow_mut() = Some(request);
+                    reply.send(Ok(json!({}))).unwrap();
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(response.error, None, "{method} {params:?}");
+        seen.into_inner().expect("group request dispatched")
+    }
+
+    fn group_request_error(method: &str, params: Value) -> i64 {
+        dispatch_request(
+            &json!({"method": method, "params": params}).to_string(),
+            &|command| panic!("unexpected command: {command:?}"),
+        )
+        .error
+        .expect("request is rejected")
+        .code
+    }
+
+    #[test]
+    fn group_methods_are_advertised() {
+        for method in [
+            "workspace.set_group",
+            "workspace.group_list",
+            "workspace.group_create",
+            "workspace.group_rename",
+            "workspace.group_set_color",
+            "workspace.group_set_collapsed",
+            "workspace.group_delete",
+        ] {
+            assert!(METHODS.contains(&method), "{method}");
+        }
+    }
+
+    #[test]
+    fn group_create_parses_name_color_and_members() {
+        assert_eq!(
+            dispatched_group_request("workspace.group_create", json!({})),
+            GroupRequest::Create {
+                name: None,
+                color: None,
+                workspaces: Vec::new(),
+            }
+        );
+        assert_eq!(
+            dispatched_group_request(
+                "workspace.group_create",
+                json!({
+                    "name": " Backend ",
+                    "color": "Teal",
+                    "workspace_id": "workspace:1",
+                    "workspace_ids": ["2", 3],
+                })
+            ),
+            GroupRequest::Create {
+                name: Some("Backend".to_string()),
+                color: Some(WorkspaceColor::Teal),
+                workspaces: vec![
+                    WorkspaceTarget::Handle("workspace:1".to_string()),
+                    WorkspaceTarget::Handle("2".to_string()),
+                    WorkspaceTarget::Handle("3".to_string()),
+                ],
+            }
+        );
+        for params in [
+            json!({"name": ""}),
+            json!({"color": "none"}),
+            json!({"color": "chartreuse"}),
+            json!({"workspace_ids": "1"}),
+            json!({"workspace_ids": [true]}),
+        ] {
+            assert_eq!(
+                group_request_error("workspace.group_create", params),
+                INVALID_PARAMS_CODE
+            );
+        }
+    }
+
+    #[test]
+    fn group_edits_take_ids_refs_or_names() {
+        assert_eq!(
+            dispatched_group_request(
+                "workspace.group_rename",
+                json!({"group_id": "group:abc", "name": "Ops"})
+            ),
+            GroupRequest::Rename {
+                group: "abc".to_string(),
+                name: "Ops".to_string(),
+            }
+        );
+        assert_eq!(
+            dispatched_group_request(
+                "workspace.group_set_color",
+                json!({"group": "Backend", "color": "red"})
+            ),
+            GroupRequest::SetColor {
+                group: "Backend".to_string(),
+                color: WorkspaceColor::Red,
+            }
+        );
+        assert_eq!(
+            dispatched_group_request(
+                "workspace.group_set_collapsed",
+                json!({"group_id": "abc", "collapsed": true})
+            ),
+            GroupRequest::SetCollapsed {
+                group: "abc".to_string(),
+                collapsed: true,
+            }
+        );
+        assert_eq!(
+            dispatched_group_request("delete-group", json!({"group_id": "abc"})),
+            GroupRequest::Delete {
+                group: "abc".to_string(),
+            }
+        );
+        for (method, params) in [
+            ("workspace.group_rename", json!({"name": "Ops"})),
+            ("workspace.group_rename", json!({"group_id": "abc"})),
+            (
+                "workspace.group_set_color",
+                json!({"group_id": "abc", "color": null}),
+            ),
+            ("workspace.group_set_collapsed", json!({"group_id": "abc"})),
+            ("workspace.group_delete", json!({})),
+        ] {
+            assert_eq!(group_request_error(method, params), INVALID_PARAMS_CODE);
+        }
+    }
+
+    #[test]
+    fn set_group_requires_an_explicit_group_or_null() {
+        assert_eq!(
+            dispatched_group_request("workspace.set_group", json!({"group_id": "group:abc"})),
+            GroupRequest::SetWorkspaceGroup {
+                target: WorkspaceTarget::Active,
+                group: Some("abc".to_string()),
+            }
+        );
+        // Like the other group methods, `group` takes an id, ref or name.
+        assert_eq!(
+            dispatched_group_request("workspace.set_group", json!({"group": "Backend"})),
+            GroupRequest::SetWorkspaceGroup {
+                target: WorkspaceTarget::Active,
+                group: Some("Backend".to_string()),
+            }
+        );
+        assert_eq!(
+            dispatched_group_request("workspace.set_group", json!({"group": null})),
+            GroupRequest::SetWorkspaceGroup {
+                target: WorkspaceTarget::Active,
+                group: None,
+            }
+        );
+        assert_eq!(
+            dispatched_group_request(
+                "workspace.set_group",
+                json!({"group_id": null, "workspace_id": "workspace:2"})
+            ),
+            GroupRequest::SetWorkspaceGroup {
+                target: WorkspaceTarget::Handle("workspace:2".to_string()),
+                group: None,
+            }
+        );
+        assert_eq!(
+            group_request_error("workspace.set_group", json!({})),
+            INVALID_PARAMS_CODE
+        );
+    }
+
+    #[test]
+    fn tab_action_requires_an_action() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tab.action",
+            "params": { "surface_id": "3:terminal-0" },
+        })
+        .to_string();
+
+        let response = dispatch_request(&request, &|_command| {
+            panic!("tab.action must be rejected before it reaches the GTK loop");
+        });
+
+        let error = response
+            .error
+            .expect("tab.action without --action must error");
+        assert_eq!(error.code, INVALID_PARAMS_CODE);
     }
 
     #[test]
@@ -998,6 +2263,80 @@ mod tests {
     }
 
     #[test]
+    fn terminal_routes_reject_empty_explicit_targets_before_dispatch() {
+        for method in [
+            "surface.send_text",
+            "send-text",
+            "send",
+            "surface.send_key",
+            "send-key",
+            "surface.read_text",
+            "read-screen",
+            "capture-pane",
+        ] {
+            for target in ["", "   ", "surface:", " surface:   "] {
+                let request = json!({ "id": 1, "method": method, "params": { "surface_id": target, "text": "must not be sent", "key": "Enter" } });
+                let response = dispatch_request(&request.to_string(), &|command| {
+                    panic!("invalid target dispatched: {command:?}")
+                });
+                assert_eq!(
+                    response.error.as_ref().map(|error| error.code),
+                    Some(INVALID_PARAMS_CODE),
+                    "{method} target {target:?}"
+                );
+            }
+        }
+        let response = dispatch_request(
+            r#"{"id":1,"method":"capture-pane","params":{"id":"surface:"}}"#,
+            &|command| panic!("empty alias dispatched: {command:?}"),
+        );
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn terminal_routes_preserve_omitted_and_nonempty_explicit_targets() {
+        for method in ["surface.send_text", "surface.send_key", "surface.read_text"] {
+            for (target, expected) in [
+                (None, None),
+                (Some("surface:4:target"), Some("4:target")),
+                (Some("missing-surface"), Some("missing-surface")),
+            ] {
+                let mut params = json!({ "text": "test", "key": "Enter" });
+                if let Some(target) = target {
+                    params["surface_id"] = json!(target);
+                }
+                let request = json!({ "id": 1, "method": method, "params": params });
+                let response = dispatch_request(&request.to_string(), &|command| {
+                    let (surface_hint, reply) = match command {
+                        ControlCommand::SendText {
+                            surface_hint,
+                            reply,
+                            ..
+                        }
+                        | ControlCommand::SendKey {
+                            surface_hint,
+                            reply,
+                            ..
+                        }
+                        | ControlCommand::ReadSurfaceText {
+                            surface_hint,
+                            reply,
+                            ..
+                        } => (surface_hint, reply),
+                        other => panic!("unexpected command: {other:?}"),
+                    };
+                    assert_eq!(surface_hint.as_deref(), expected, "{method}");
+                    let _ = reply.send(Ok(json!({})));
+                });
+                assert_eq!(response.error, None);
+            }
+        }
+    }
+
+    #[test]
     fn read_text_route_accepts_capture_alias_and_surface_refs() {
         let response = dispatch_request(
             r#"{"id":1,"method":"capture-pane","params":{"surface_id":"surface:9:tab"}}"#,
@@ -1042,5 +2381,115 @@ mod tests {
 
         assert_eq!(response.error, None);
         assert_eq!(response.result.expect("result")["ok"], true);
+    }
+
+    fn dispatched_gui_hook_request(method: &str, params: Value) -> GuiHookRequest {
+        let seen = std::cell::RefCell::new(None);
+        let response = dispatch_request(
+            &json!({"method": method, "params": params}).to_string(),
+            &|command| match command {
+                ControlCommand::GuiHook { request, reply } => {
+                    *seen.borrow_mut() = Some(request);
+                    reply.send(Ok(json!({}))).unwrap();
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(response.error, None, "{method} {params:?}");
+        seen.into_inner().expect("gui hook request dispatched")
+    }
+
+    #[test]
+    fn gui_hook_requests_parse_event_command_and_flags() {
+        for method in ["gui_hook.list", "gui_hook.set", "gui_hook.clear"] {
+            assert!(METHODS.contains(&method), "{method}");
+        }
+        assert_eq!(
+            dispatched_gui_hook_request("gui_hook.list", json!({})),
+            GuiHookRequest::List
+        );
+        assert_eq!(
+            dispatched_gui_hook_request(
+                "gui_hook.set",
+                json!({"event": "on-workspace-create", "command": "new.sh --force", "show_terminal": true}),
+            ),
+            GuiHookRequest::Set {
+                event: GuiHookEvent::OnWorkspaceCreate,
+                update: GuiHookUpdate {
+                    command: Some("new.sh --force".to_string()),
+                    show_terminal: Some(true),
+                    ..Default::default()
+                },
+            }
+        );
+        assert_eq!(
+            dispatched_gui_hook_request(
+                "gui_hook.set",
+                json!({"hook": "on_workspace_delete", "enabled": false, "suppress_default": false}),
+            ),
+            GuiHookRequest::Set {
+                event: GuiHookEvent::OnWorkspaceDelete,
+                update: GuiHookUpdate {
+                    enabled: Some(false),
+                    suppress_default: Some(false),
+                    ..Default::default()
+                },
+            }
+        );
+        assert_eq!(
+            dispatched_gui_hook_request(
+                "gui_hook.set",
+                json!({"event": "after-workspace-delete", "command": "cleanup.sh", "show_terminal": true}),
+            ),
+            GuiHookRequest::Set {
+                event: GuiHookEvent::AfterWorkspaceDelete,
+                update: GuiHookUpdate {
+                    command: Some("cleanup.sh".to_string()),
+                    show_terminal: Some(true),
+                    ..Default::default()
+                },
+            }
+        );
+        assert_eq!(
+            dispatched_gui_hook_request("gui_hook.clear", json!({"event": "on-workspace-delete"})),
+            GuiHookRequest::Clear {
+                event: GuiHookEvent::OnWorkspaceDelete,
+            }
+        );
+    }
+
+    #[test]
+    fn gui_hook_requests_reject_bad_params() {
+        for (method, params) in [
+            ("gui_hook.set", json!({"command": "x"})),
+            (
+                "gui_hook.set",
+                json!({"event": "on-tab-create", "command": "x"}),
+            ),
+            ("gui_hook.set", json!({"event": "on-workspace-create"})),
+            (
+                "gui_hook.set",
+                json!({"event": "on-workspace-create", "command": " "}),
+            ),
+            (
+                "gui_hook.set",
+                json!({"event": "on-workspace-create", "show_terminal": "yes"}),
+            ),
+            (
+                "gui_hook.set",
+                json!({"event": "on-workspace-create", "enabled": 0}),
+            ),
+            (
+                "gui_hook.set",
+                json!({"event": "after-workspace-create", "suppress_default": false}),
+            ),
+            ("gui_hook.clear", json!({})),
+        ] {
+            assert_eq!(
+                group_request_error(method, params.clone()),
+                INVALID_PARAMS_CODE,
+                "{method} {params}"
+            );
+        }
     }
 }

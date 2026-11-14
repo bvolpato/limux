@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Unit tests for the AppImage SVG-loader bundling logic in scripts/package.sh.
+# Regression tests for AppImage packaging logic.
 #
 # Tests are pure-shell. They isolate the relevant blocks so they can be
 # exercised without running a full package build.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PACKAGE_SH="$SCRIPT_DIR/../package.sh"
+APPIMAGE_WEBKIT_SH="$SCRIPT_DIR/../appimage-webkit.sh"
+
+# shellcheck disable=SC1090,SC1091
+source "$APPIMAGE_WEBKIT_SH"
 
 PASS=0
 FAIL=0
@@ -142,6 +145,8 @@ run_apprun_preserve_block() {
     GDK_PIXBUF_MODULE_FILE="${2-}" \
     WEBKIT_EXEC_PATH="${3-}" \
     WEBKIT_INJECTED_BUNDLE_PATH="${4-}" \
+    GBM_BACKENDS_PATH="${5-}" \
+    LIBGL_DRIVERS_PATH="${6-}" \
     bash -c '
         if [ "${LD_LIBRARY_PATH+x}" = x ]; then
             export LIMUX_ORIGINAL_LD_LIBRARY_PATH_SET=1
@@ -171,25 +176,75 @@ run_apprun_preserve_block() {
             export LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH_SET=0
             export LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH=""
         fi
+        if [ "${GBM_BACKENDS_PATH+x}" = x ]; then
+            export LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET=1
+            export LIMUX_ORIGINAL_GBM_BACKENDS_PATH="${GBM_BACKENDS_PATH}"
+        else
+            export LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET=0
+            export LIMUX_ORIGINAL_GBM_BACKENDS_PATH=""
+        fi
+        if [ "${LIBGL_DRIVERS_PATH+x}" = x ]; then
+            export LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET=1
+            export LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH="${LIBGL_DRIVERS_PATH}"
+        else
+            export LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET=0
+            export LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH=""
+        fi
         printf "%s\n" \
             "$LIMUX_ORIGINAL_LD_LIBRARY_PATH_SET:$LIMUX_ORIGINAL_LD_LIBRARY_PATH" \
             "$LIMUX_ORIGINAL_GDK_PIXBUF_MODULE_FILE_SET:$LIMUX_ORIGINAL_GDK_PIXBUF_MODULE_FILE" \
             "$LIMUX_ORIGINAL_WEBKIT_EXEC_PATH_SET:$LIMUX_ORIGINAL_WEBKIT_EXEC_PATH" \
-            "$LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH_SET:$LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH"
+            "$LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH_SET:$LIMUX_ORIGINAL_WEBKIT_INJECTED_BUNDLE_PATH" \
+            "$LIMUX_ORIGINAL_GBM_BACKENDS_PATH_SET:$LIMUX_ORIGINAL_GBM_BACKENDS_PATH" \
+            "$LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH_SET:$LIMUX_ORIGINAL_LIBGL_DRIVERS_PATH"
     '
 }
 
-result=$(run_apprun_preserve_block "/host/lib" "/host/pixbuf.cache" "/host/webkit" "/host/bundle")
-expected=$'1:/host/lib\n1:/host/pixbuf.cache\n1:/host/webkit\n1:/host/bundle'
+result=$(run_apprun_preserve_block "/host/lib" "/host/pixbuf.cache" "/host/webkit" "/host/bundle" "/host/gbm" "/host/dri")
+expected=$'1:/host/lib\n1:/host/pixbuf.cache\n1:/host/webkit\n1:/host/bundle\n1:/host/gbm\n1:/host/dri'
 if [[ "$result" == "$expected" ]]; then
     pass "records original app-sensitive environment"
 else
     fail "records original app-sensitive environment" "got: $result"
 fi
 
-# ----- T5: LIMUX_REQUIRE_SVG_LOADER hard-fail vs warn-only -----
+# ----- T5: AppRun discovers host Mesa module directories -----
 
-echo "T5: LIMUX_REQUIRE_SVG_LOADER gates exit 1"
+echo "T5: AppRun host Mesa module discovery"
+
+HOST_GBM_DIR="$HEREDOC_TMP/host/lib/gbm"
+HOST_DRI_DIR="$HEREDOC_TMP/host/lib/dri"
+mkdir -p "$HOST_GBM_DIR" "$HOST_DRI_DIR"
+touch "$HOST_GBM_DIR/dri_gbm.so" "$HOST_DRI_DIR/iris_dri.so"
+
+discover_graphics_dir() {
+    local pattern="$1"
+    shift
+    local candidate
+    for candidate in "$@"; do
+        if [ -d "$candidate" ] && compgen -G "${candidate}/${pattern}" >/dev/null; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if [ "$(discover_graphics_dir '*_gbm.so' "$HEREDOC_TMP/missing" "$HOST_GBM_DIR")" = "$HOST_GBM_DIR" ]; then
+    pass "discovers versioned GBM backend directory"
+else
+    fail "GBM backend discovery" "did not select $HOST_GBM_DIR"
+fi
+
+if [ "$(discover_graphics_dir '*_dri.so' "$HEREDOC_TMP/missing" "$HOST_DRI_DIR")" = "$HOST_DRI_DIR" ]; then
+    pass "discovers host DRI driver directory"
+else
+    fail "DRI driver discovery" "did not select $HOST_DRI_DIR"
+fi
+
+# ----- T6: LIMUX_REQUIRE_SVG_LOADER hard-fail vs warn-only -----
+
+echo "T6: LIMUX_REQUIRE_SVG_LOADER gates exit 1"
 
 # Excerpt the warn-or-exit logic — paste-equivalent to the script.
 warn_or_exit() {
@@ -215,6 +270,65 @@ if [ "$ec" = "99" ]; then
     pass "LIMUX_REQUIRE_SVG_LOADER=1 -> hard fail (exit 99)"
 else
     fail "hard-fail path" "expected exit 99, got $ec"
+fi
+
+# ----- T7: host graphics libraries stay outside the AppImage -----
+
+echo "T7: AppImage uses host graphics libraries"
+
+for library in \
+    libEGL.so.1 \
+    libGL.so.1 \
+    libGLESv1_CM.so.1 \
+    libGLESv2.so.2 \
+    libGLX.so.0 \
+    libGLdispatch.so.0 \
+    libOpenGL.so.0 \
+    libdrm.so.2 \
+    libdrm_amdgpu.so.1 \
+    libgbm.so.1 \
+    libglapi.so.0 \
+    libwayland-client.so.0 \
+    libwayland-cursor.so.0 \
+    libwayland-egl.so.1 \
+    libwayland-server.so.0
+do
+    if is_appimage_system_library "/usr/lib/$library"; then
+        pass "excludes $library"
+    else
+        fail "host graphics exclusion" "$library would be bundled"
+    fi
+done
+
+if ! is_appimage_system_library "/usr/lib/libwebkitgtk-6.0.so.4"; then
+    pass "keeps application runtime libraries bundled"
+else
+    fail "application runtime closure" "libwebkitgtk-6.0.so.4 would be excluded"
+fi
+
+# ----- T8: WebKitGTK process path is made relative to AppRun cwd -----
+
+echo "T8: AppImage relocates WebKitGTK process path"
+
+WEBKIT_APPDIR="$HEREDOC_TMP/webkit-appdir"
+WEBKIT_LIBRARY="$WEBKIT_APPDIR/usr/lib/libwebkitgtk-6.0.so.4"
+WEBKITGTK_RUNTIME_DIR="/usr/lib/x86_64-linux-gnu/webkitgtk-6.0"
+WEBKITGTK_PROCESS_DIR="$WEBKITGTK_RUNTIME_DIR"
+mkdir -p "$(dirname "$WEBKIT_LIBRARY")"
+printf '%s\0%s\0' \
+    "$WEBKITGTK_PROCESS_DIR" \
+    "$WEBKITGTK_RUNTIME_DIR/injected-bundle/" \
+    > "$WEBKIT_LIBRARY"
+chmod 755 "$WEBKIT_LIBRARY"
+
+patch_appimage_webkit_paths "$WEBKIT_APPDIR"
+
+if grep -aFq "$WEBKITGTK_PROCESS_DIR" "$WEBKIT_LIBRARY"; then
+    fail "WebKitGTK path relocation" "compiled-in process path remains"
+elif ! grep -aFq "usr/lib/webkitgtk-6.0" "$WEBKIT_LIBRARY"; then
+    fail "WebKitGTK path relocation" "relative process path is missing"
+else
+    pass "rewrites compiled-in process and injected-bundle paths"
 fi
 
 # ----- Summary -----

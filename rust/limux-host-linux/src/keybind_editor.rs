@@ -191,13 +191,17 @@ pub fn build_keybind_editor(
             error_label: error_label.clone(),
         });
 
+        // Weak: the button is inside `outer` and listed in `rows`.
         {
             let listening = listening.clone();
             let errors = errors.clone();
-            let rows = rows.clone();
+            let rows = Rc::downgrade(&rows);
             let state = state.clone();
-            let outer = outer.clone();
+            let outer = outer.downgrade();
             binding_button.connect_clicked(move |button| {
+                let (Some(rows), Some(outer)) = (rows.upgrade(), outer.upgrade()) else {
+                    return;
+                };
                 *listening.borrow_mut() = Some(shortcut_id);
                 errors.borrow_mut().remove(&shortcut_id);
                 sync_editor_listening_class(&outer, true);
@@ -218,10 +222,13 @@ pub fn build_keybind_editor(
         let rows = rows.clone();
         let state = state.clone();
         let on_capture = on_capture.clone();
-        let outer_for_controller = outer.clone();
+        let outer_for_controller = outer.downgrade();
         let key_controller = gtk::EventControllerKey::new();
         key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
         key_controller.connect_key_pressed(move |controller, keyval, keycode, modifier| {
+            let Some(outer_for_controller) = outer_for_controller.upgrade() else {
+                return gtk::glib::Propagation::Proceed;
+            };
             let Some(shortcut_id) = *listening.borrow() else {
                 return gtk::glib::Propagation::Proceed;
             };

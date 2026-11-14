@@ -5,12 +5,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::gui_hooks::GuiHooksConfig;
 use crate::shortcut_config;
 
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
 pub const DEFAULT_UI_SCALE: f32 = 1.0;
 pub const MIN_UI_SCALE: f32 = 0.8;
 pub const MAX_UI_SCALE: f32 = 2.0;
+pub const DEFAULT_TAB_ACTIVITY_SECONDS: u32 = 5;
+pub const MIN_TAB_ACTIVITY_SECONDS: u32 = 1;
+pub const MAX_TAB_ACTIVITY_SECONDS: u32 = 60;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ColorScheme {
@@ -39,6 +43,30 @@ impl ColorScheme {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowControlsSide {
+    Left,
+    #[default]
+    Right,
+}
+
+impl WindowControlsSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -52,12 +80,86 @@ pub struct AppConfig {
     #[serde(skip)]
     pub clipboard: ClipboardConfig,
     #[serde(skip)]
+    pub interface: InterfaceConfig,
+    #[serde(skip)]
+    pub links: LinkConfig,
+    #[serde(skip)]
     pub font_size: Option<f32>,
+    #[serde(skip)]
+    pub hooks: GuiHooksConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WorkspaceConfig {
     pub keep_open_after_last_terminal_closes: bool,
+    pub prompt_for_folder_on_create: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnreadColor {
+    #[default]
+    Amber,
+    Emerald,
+    Rose,
+    Cyan,
+    AccentBlue,
+}
+
+impl UnreadColor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Amber => "amber",
+            Self::Emerald => "emerald",
+            Self::Rose => "rose",
+            Self::Cyan => "cyan",
+            Self::AccentBlue => "accent_blue",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "amber" => Some(Self::Amber),
+            "emerald" => Some(Self::Emerald),
+            "rose" => Some(Self::Rose),
+            "cyan" => Some(Self::Cyan),
+            "accent_blue" => Some(Self::AccentBlue),
+            _ => None,
+        }
+    }
+
+    pub fn css_color(self) -> &'static str {
+        match self {
+            Self::Amber => "#f59e0b",
+            Self::Emerald => "#10b981",
+            Self::Rose => "#f43f5e",
+            Self::Cyan => "#06b6d4",
+            Self::AccentBlue => "@accent_bg_color",
+        }
+    }
+
+    pub fn labels() -> &'static [&'static str] {
+        &["Amber (Default)", "Emerald", "Rose", "Cyan", "Accent Blue"]
+    }
+
+    pub fn dropdown_index(self) -> u32 {
+        match self {
+            Self::Amber => 0,
+            Self::Emerald => 1,
+            Self::Rose => 2,
+            Self::Cyan => 3,
+            Self::AccentBlue => 4,
+        }
+    }
+
+    pub fn from_dropdown_index(index: u32) -> Self {
+        match index {
+            1 => Self::Emerald,
+            2 => Self::Rose,
+            3 => Self::Cyan,
+            4 => Self::AccentBlue,
+            _ => Self::Amber,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +168,7 @@ pub struct AppearanceConfig {
     pub ghostty_color_scheme: ColorScheme,
     pub ui_scale: UiScale,
     pub show_workspace_path: bool,
+    pub unread_color: UnreadColor,
 }
 
 impl Default for AppearanceConfig {
@@ -75,6 +178,7 @@ impl Default for AppearanceConfig {
             ghostty_color_scheme: ColorScheme::default(),
             ui_scale: UiScale::default(),
             show_workspace_path: true,
+            unread_color: UnreadColor::default(),
         }
     }
 }
@@ -104,6 +208,27 @@ impl UiScale {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceConfig {
+    pub window_controls_side: WindowControlsSide,
+    pub show_top_bar: bool,
+    pub show_workspace_indicators: bool,
+    pub show_tab_activity: bool,
+    pub tab_activity_seconds: u32,
+}
+
+impl Default for InterfaceConfig {
+    fn default() -> Self {
+        Self {
+            window_controls_side: WindowControlsSide::default(),
+            show_top_bar: true,
+            show_workspace_indicators: true,
+            show_tab_activity: true,
+            tab_activity_seconds: DEFAULT_TAB_ACTIVITY_SECONDS,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct FocusConfig {
     #[serde(default)]
@@ -121,6 +246,57 @@ impl Default for ClipboardConfig {
             copy_selection_to_clipboard: true,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinkOpenDestination {
+    #[default]
+    DefaultBrowser,
+    BrowserTab,
+}
+
+impl LinkOpenDestination {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DefaultBrowser => "default_browser",
+            Self::BrowserTab => "browser_tab",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "default_browser" => Some(Self::DefaultBrowser),
+            "browser_tab" => Some(Self::BrowserTab),
+            _ => None,
+        }
+    }
+
+    pub fn dropdown_index(self) -> u32 {
+        match self {
+            Self::DefaultBrowser => 0,
+            Self::BrowserTab => 1,
+        }
+    }
+
+    pub fn from_dropdown_index(index: u32) -> Self {
+        match index {
+            1 => Self::BrowserTab,
+            _ => Self::DefaultBrowser,
+        }
+    }
+
+    pub fn effective(self, embedded_browser_available: bool) -> Self {
+        if self == Self::BrowserTab && !embedded_browser_available {
+            Self::DefaultBrowser
+        } else {
+            self
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkConfig {
+    pub open_destination: LinkOpenDestination,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -313,9 +489,19 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
+    let unread_color = appearance
+        .and_then(|appearance| appearance.get("unread_color"))
+        .and_then(Value::as_str)
+        .and_then(UnreadColor::from_str)
+        .unwrap_or_default();
+
     let workspace = root.get("workspace").and_then(Value::as_object);
     let keep_open_after_last_terminal_closes = workspace
         .and_then(|workspace| workspace.get("keep_open_after_last_terminal_closes"))
+        .and_then(Value::as_bool)
+        .unwrap_or_default();
+    let prompt_for_folder_on_create = workspace
+        .and_then(|workspace| workspace.get("prompt_for_folder_on_create"))
         .and_then(Value::as_bool)
         .unwrap_or_default();
 
@@ -338,11 +524,52 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(Value::as_bool)
         .unwrap_or(clipboard_defaults.copy_selection_to_clipboard);
 
+    let open_destination = root
+        .get("links")
+        .and_then(Value::as_object)
+        .and_then(|links| links.get("open_destination"))
+        .and_then(Value::as_str)
+        .and_then(LinkOpenDestination::from_str)
+        .unwrap_or_default();
+
     let font_size = root
         .get("font_size")
         .and_then(Value::as_f64)
         .map(|v| v as f32)
         .filter(|v| (1.0..=255.0).contains(v));
+
+    let interface_obj = root.get("interface").and_then(Value::as_object);
+
+    let window_controls_side = interface_obj
+        .and_then(|interface| interface.get("window_controls_side"))
+        .and_then(Value::as_str)
+        .and_then(WindowControlsSide::from_str)
+        .unwrap_or_default();
+
+    let show_top_bar = interface_obj
+        .and_then(|interface| interface.get("show_top_bar"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let show_workspace_indicators = interface_obj
+        .and_then(|interface| interface.get("show_workspace_indicators"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let show_tab_activity = interface_obj
+        .and_then(|interface| interface.get("show_tab_activity"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let tab_activity_seconds = interface_obj
+        .and_then(|interface| interface.get("tab_activity_seconds"))
+        .and_then(Value::as_u64)
+        .filter(|seconds| {
+            (u64::from(MIN_TAB_ACTIVITY_SECONDS)..=u64::from(MAX_TAB_ACTIVITY_SECONDS))
+                .contains(seconds)
+        })
+        .map(|seconds| seconds as u32)
+        .unwrap_or(DEFAULT_TAB_ACTIVITY_SECONDS);
 
     AppConfig {
         focus: FocusConfig {
@@ -353,9 +580,11 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             ghostty_color_scheme,
             ui_scale,
             show_workspace_path,
+            unread_color,
         },
         workspace: WorkspaceConfig {
             keep_open_after_last_terminal_closes,
+            prompt_for_folder_on_create,
         },
         notifications: NotificationConfig {
             enabled: notifications_enabled,
@@ -364,7 +593,16 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         clipboard: ClipboardConfig {
             copy_selection_to_clipboard,
         },
+        interface: InterfaceConfig {
+            window_controls_side,
+            show_top_bar,
+            show_workspace_indicators,
+            show_tab_activity,
+            tab_activity_seconds,
+        },
+        links: LinkConfig { open_destination },
         font_size,
+        hooks: GuiHooksConfig::from_value(root.get("hooks")),
     }
 }
 
@@ -399,6 +637,12 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             json!(config.appearance.ui_scale.get()),
         );
     }
+    if config.appearance.unread_color != UnreadColor::default() {
+        appearance.insert(
+            "unread_color".to_string(),
+            json!(config.appearance.unread_color.as_str()),
+        );
+    }
     root.insert("appearance".to_string(), Value::Object(appearance));
     root.insert(
         "focus".to_string(),
@@ -410,6 +654,9 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "keep_open_after_last_terminal_closes": config
                 .workspace
                 .keep_open_after_last_terminal_closes,
+            "prompt_for_folder_on_create": config
+                .workspace
+                .prompt_for_folder_on_create,
         }),
     );
     root.insert(
@@ -425,11 +672,31 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "copy_selection_to_clipboard": config.clipboard.copy_selection_to_clipboard,
         }),
     );
+    root.insert(
+        "interface".to_string(),
+        json!({
+            "window_controls_side": config.interface.window_controls_side.as_str(),
+            "show_top_bar": config.interface.show_top_bar,
+            "show_workspace_indicators": config.interface.show_workspace_indicators,
+            "show_tab_activity": config.interface.show_tab_activity,
+            "tab_activity_seconds": config.interface.tab_activity_seconds,
+        }),
+    );
+    root.insert(
+        "links".to_string(),
+        json!({ "open_destination": config.links.open_destination.as_str() }),
+    );
 
     if let Some(size) = config.font_size {
         root.insert("font_size".to_string(), json!(size));
     } else {
         root.remove("font_size");
+    }
+
+    if let Some(hooks) = config.hooks.to_value() {
+        root.insert("hooks".to_string(), hooks);
+    } else {
+        root.remove("hooks");
     }
 
     let serialized =
@@ -541,7 +808,8 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
             "hover_terminal_focus": false
         },
         "workspace": {
-            "keep_open_after_last_terminal_closes": false
+            "keep_open_after_last_terminal_closes": false,
+            "prompt_for_folder_on_create": false
         },
         "notifications": {
             "enabled": true,
@@ -549,6 +817,16 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
         },
         "clipboard": {
             "copy_selection_to_clipboard": true
+        },
+        "interface": {
+            "window_controls_side": "right",
+            "show_top_bar": true,
+            "show_workspace_indicators": true,
+            "show_tab_activity": true,
+            "tab_activity_seconds": 5
+        },
+        "links": {
+            "open_destination": "default_browser"
         }
     });
     let serialized = serde_json::to_string_pretty(&default_root)
@@ -563,6 +841,104 @@ mod tests {
     use std::ffi::OsString;
 
     use tempfile::TempDir;
+
+    #[test]
+    fn interface_preferences_round_trip_without_losing_link_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("settings.json");
+        for side in [WindowControlsSide::Left, WindowControlsSide::Right] {
+            let config = AppConfig {
+                interface: InterfaceConfig {
+                    window_controls_side: side,
+                    show_top_bar: false,
+                    show_workspace_indicators: false,
+                    show_tab_activity: false,
+                    tab_activity_seconds: 12,
+                },
+                links: LinkConfig {
+                    open_destination: LinkOpenDestination::BrowserTab,
+                },
+                ..Default::default()
+            };
+
+            save_to_path(&path, &config).expect("save config");
+            let loaded = load_from_path(&path);
+            assert!(loaded.warnings.is_empty());
+            assert_eq!(loaded.config, config);
+        }
+    }
+
+    #[test]
+    fn gui_hooks_round_trip_and_clearing_them_removes_the_key() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("settings.json");
+        let mut config = AppConfig {
+            hooks: GuiHooksConfig {
+                on_workspace_delete: crate::gui_hooks::GuiHook {
+                    enabled: false,
+                    command: "cleanup.sh -y".to_string(),
+                    show_terminal: true,
+                    suppress_default: true,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        save_to_path(&path, &config).expect("save config");
+        assert_eq!(load_from_path(&path).config, config);
+
+        config.hooks = GuiHooksConfig::default();
+        save_to_path(&path, &config).expect("save config");
+        let root: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(root.get("hooks").is_none(), "{root}");
+    }
+
+    #[test]
+    fn missing_and_invalid_interface_preferences_use_defaults() {
+        for root in [
+            json!({}),
+            json!({"interface": {
+                "window_controls_side": "unknown",
+                "show_top_bar": "false",
+                "show_workspace_indicators": null,
+                "show_tab_activity": null,
+                "tab_activity_seconds": 0
+            }}),
+        ] {
+            assert_eq!(
+                parse_app_config_value(&root).interface,
+                InterfaceConfig::default()
+            );
+        }
+    }
+
+    #[test]
+    fn tab_activity_timeout_accepts_only_integer_values_in_range() {
+        for seconds in [1, DEFAULT_TAB_ACTIVITY_SECONDS, 60] {
+            let root = json!({ "interface": { "tab_activity_seconds": seconds } });
+            assert_eq!(
+                parse_app_config_value(&root).interface.tab_activity_seconds,
+                seconds
+            );
+        }
+
+        for invalid in [
+            json!(0),
+            json!(61),
+            json!(-1),
+            json!(5.5),
+            json!("5"),
+            json!(null),
+        ] {
+            let root = json!({ "interface": { "tab_activity_seconds": invalid } });
+            assert_eq!(
+                parse_app_config_value(&root).interface.tab_activity_seconds,
+                DEFAULT_TAB_ACTIVITY_SECONDS,
+                "invalid timeout should use the default: {root}"
+            );
+        }
+    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -639,6 +1015,12 @@ mod tests {
             parsed["clipboard"]["copy_selection_to_clipboard"],
             Value::Bool(true)
         );
+        assert_eq!(parsed["interface"]["show_tab_activity"], Value::Bool(true));
+        assert_eq!(parsed["interface"]["tab_activity_seconds"], Value::from(5));
+        assert_eq!(
+            parsed["links"]["open_destination"],
+            Value::String("default_browser".to_string())
+        );
     }
 
     #[test]
@@ -713,6 +1095,28 @@ mod tests {
     }
 
     #[test]
+    fn save_and_load_round_trips_unread_color() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        let mut config = AppConfig::default();
+        assert_eq!(config.appearance.unread_color, UnreadColor::Amber);
+
+        for color in [
+            UnreadColor::Amber,
+            UnreadColor::Emerald,
+            UnreadColor::Rose,
+            UnreadColor::Cyan,
+            UnreadColor::AccentBlue,
+        ] {
+            config.appearance.unread_color = color;
+            save_to_path(&path, &config).expect("save config");
+            let loaded = load_from_path(&path);
+            assert!(loaded.warnings.is_empty());
+            assert_eq!(loaded.config.appearance.unread_color, color);
+        }
+    }
+
+    #[test]
     fn load_from_path_reads_font_size_when_valid() {
         let dir = TempDir::new().expect("temp dir");
         let path = settings_path_in(dir.path());
@@ -776,6 +1180,62 @@ mod tests {
 
         assert!(loaded.warnings.is_empty());
         assert!(!loaded.config.clipboard.copy_selection_to_clipboard);
+    }
+
+    #[test]
+    fn load_from_path_reads_link_destination_and_defaults_invalid_values() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "links": {
+    "open_destination": "browser_tab"
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+        assert_eq!(
+            loaded.config.links.open_destination,
+            LinkOpenDestination::BrowserTab
+        );
+
+        fs::write(
+            &path,
+            r#"{
+  "links": {
+    "open_destination": "invalid"
+  }
+}
+"#,
+        )
+        .expect("write invalid destination");
+
+        let loaded = load_from_path(&path);
+        assert_eq!(
+            loaded.config.links.open_destination,
+            LinkOpenDestination::DefaultBrowser
+        );
+    }
+
+    #[test]
+    fn link_destination_matches_embedded_browser_availability() {
+        assert_eq!(
+            LinkOpenDestination::BrowserTab.effective(true),
+            LinkOpenDestination::BrowserTab
+        );
+        assert_eq!(
+            LinkOpenDestination::BrowserTab.effective(false),
+            LinkOpenDestination::DefaultBrowser
+        );
+        assert_eq!(
+            LinkOpenDestination::DefaultBrowser.effective(false),
+            LinkOpenDestination::DefaultBrowser
+        );
     }
 
     #[test]
@@ -989,6 +1449,24 @@ mod tests {
         assert_eq!(
             parsed["clipboard"]["copy_selection_to_clipboard"],
             Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn save_to_path_writes_link_destination() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+
+        let mut config = AppConfig::default();
+        config.links.open_destination = LinkOpenDestination::BrowserTab;
+        save_to_path(&path, &config).expect("save link destination");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(
+            parsed["links"]["open_destination"],
+            Value::String("browser_tab".to_string())
         );
     }
 

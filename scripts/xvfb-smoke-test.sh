@@ -8,18 +8,105 @@
 # Usage:
 #   ./scripts/xvfb-smoke-test.sh                # release build
 #   LIMUX_SMOKE_PROFILE=debug ./scripts/xvfb-smoke-test.sh
+#   LIMUX_SMOKE_GRAPHICS=hardware LIMUX_EXPECT_GL_VENDOR=NVIDIA \
+#     LIMUX_EXPECT_GL_RENDERER='RTX 5070 Ti' ./scripts/xvfb-smoke-test.sh
 set -euo pipefail
 
-PROFILE="${LIMUX_SMOKE_PROFILE:-release}"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+"$ROOT_DIR/scripts/check-ghostty.sh"
+
+PROFILE="${LIMUX_SMOKE_PROFILE:-release}"
+GRAPHICS="${LIMUX_SMOKE_GRAPHICS:-software}"
+CYCLES="${LIMUX_SMOKE_CYCLES:-10}"
+case "$GRAPHICS" in
+  software) ;;
+  hardware)
+    if [ -z "${LIMUX_EXPECT_GL_VENDOR:-}" ] || [ -z "${LIMUX_EXPECT_GL_RENDERER:-}" ]; then
+      echo "FAIL: hardware mode requires LIMUX_EXPECT_GL_VENDOR and LIMUX_EXPECT_GL_RENDERER"
+      exit 2
+    fi
+    ;;
+  *) echo "FAIL: LIMUX_SMOKE_GRAPHICS must be software or hardware"; exit 2 ;;
+esac
+if [[ ! "$CYCLES" =~ ^([1-9]|[1-9][0-9]|100)$ ]]; then
+  echo "FAIL: LIMUX_SMOKE_CYCLES must be between 1 and 100"
+  exit 2
+fi
+KEEP_ARTIFACTS="${LIMUX_SMOKE_KEEP_ARTIFACTS:-0}"
+if [ "$GRAPHICS" = hardware ]; then KEEP_ARTIFACTS=1; fi
+case "$KEEP_ARTIFACTS" in
+  0|1) ;;
+  *) echo "FAIL: LIMUX_SMOKE_KEEP_ARTIFACTS must be 0 or 1"; exit 2 ;;
+esac
+if [ "${1:-}" != --inside-dbus ]; then
+  command -v dbus-run-session >/dev/null || { echo "FAIL: dbus-run-session missing"; exit 2; }
+  command -v findmnt >/dev/null || { echo "FAIL: findmnt missing"; exit 2; }
+  command -v jq >/dev/null || { echo "FAIL: jq missing"; exit 2; }
+  DEMO_DIR="$(mktemp -d -t limux-smoke-XXXXXX)"
+  export LIMUX_SMOKE_RUN_DIR="$DEMO_DIR"
+  export XDG_DATA_HOME="$DEMO_DIR/data" XDG_STATE_HOME="$DEMO_DIR/state"
+  export XDG_CONFIG_HOME="$DEMO_DIR/config" XDG_CACHE_HOME="$DEMO_DIR/cache"
+  export XDG_RUNTIME_DIR="$DEMO_DIR/runtime"
+  mkdir -p "$XDG_DATA_HOME/limux" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
+  chmod 700 "$XDG_RUNTIME_DIR"
+  export GTK_USE_PORTAL=0 GIO_USE_VFS=local GTK_A11Y=none
+  unset DBUS_SESSION_BUS_ADDRESS DBUS_STARTER_ADDRESS DBUS_STARTER_BUS_TYPE DISPLAY WAYLAND_DISPLAY
+  unset GNOME_KEYRING_CONTROL SSH_AUTH_SOCK GPG_AGENT_INFO
+  export GDK_BACKEND=wayland WAYLAND_DISPLAY=wayland-limux-smoke
+  # Terminal smoke needs a bus, not desktop service activation. In particular,
+  # do not start portals or keyrings that can use paths outside the private XDG.
+  cat > "$DEMO_DIR/dbus.conf" <<'SMOKE_DBUS'
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir=/tmp</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+SMOKE_DBUS
+
+  # D-Bus activation inherits the private paths too. Only this outer invocation
+  # owns directory cleanup, after its private bus and smoke command have exited.
+  result=0
+  dbus-run-session --config-file="$DEMO_DIR/dbus.conf" -- bash "$0" --inside-dbus || result=$?
+  if [ "$result" -eq 0 ] && [ "$KEEP_ARTIFACTS" = 0 ]; then
+    # Portals may leave a private FUSE mount briefly after the bus exits.
+    # Read the kernel mount table without resolving or touching those paths.
+    private_mounts=""
+    for _ in $(seq 1 50); do
+      if ! private_mounts="$(findmnt --kernel --list --json --output TARGET --nocanonicalize \
+        | jq -r --arg root "$DEMO_DIR" '.filesystems[].target | select(. == $root or startswith($root + "/"))')"; then
+        echo "FAIL: could not verify private mounts before cleanup"
+        result=1
+        break
+      fi
+      [ -z "$private_mounts" ] && break
+      sleep 0.1
+    done
+    if [ -n "$private_mounts" ]; then
+      echo "FAIL: private mounts remain after D-Bus shutdown: $private_mounts"
+      result=1
+    fi
+    if [ "$result" -eq 0 ]; then rm -rf "$DEMO_DIR"; fi
+  fi
+  if [ "$result" -ne 0 ] || [ "$KEEP_ARTIFACTS" = 1 ]; then
+    echo "artifacts retained at: $DEMO_DIR"
+  fi
+  exit "$result"
+fi
 cd "$ROOT_DIR"
 
-DEMO_DIR="$(mktemp -d -t limux-smoke-XXXXXX)"
+DEMO_DIR="${LIMUX_SMOKE_RUN_DIR:?private smoke directory missing}"
 LOG_DIR="$DEMO_DIR/logs"
 mkdir -p "$LOG_DIR"
 
 echo "== limux agent-integrations smoke test =="
 echo "profile:   $PROFILE"
+echo "graphics:  $GRAPHICS (headless Wayland)"
+echo "cycles:    $CYCLES"
 echo "demo dir:  $DEMO_DIR"
 echo "log dir:   $LOG_DIR"
 
@@ -32,6 +119,7 @@ command -v cargo >/dev/null || { echo "FAIL: cargo missing"; exit 2; }
 command -v jq >/dev/null || { echo "FAIL: jq missing"; exit 2; }
 command -v sed >/dev/null || { echo "FAIL: sed missing"; exit 2; }
 command -v setsid >/dev/null || { echo "FAIL: setsid missing"; exit 2; }
+command -v tmux >/dev/null || { echo "FAIL: tmux missing"; exit 2; }
 
 # --- 2. Build -------------------------------------------------------------
 if [ "$PROFILE" = "release" ]; then
@@ -43,10 +131,10 @@ else
 fi
 
 echo "-- building limux-cli ($PROFILE)..."
-cargo build $CARGO_FLAGS -p limux-cli --bin limux-cli 2>&1 | tail -3
+cargo build --locked $CARGO_FLAGS -p limux-cli --bin limux-cli 2>&1 | tail -3
 
 echo "-- building limux-host-linux ($PROFILE)..."
-cargo build $CARGO_FLAGS -p limux-host-linux 2>&1 | tail -3
+cargo build --locked $CARGO_FLAGS -p limux-host-linux 2>&1 | tail -3
 
 LIMUX_HOST="$ROOT_DIR/$BIN_DIR/limux"
 LIMUX_CLI="$ROOT_DIR/$BIN_DIR/limux-cli"
@@ -58,6 +146,15 @@ LIBGHOSTTY_DIR="$ROOT_DIR/ghostty/zig-out/lib"
 if [ -d "$LIBGHOSTTY_DIR" ]; then
   export LD_LIBRARY_PATH="$LIBGHOSTTY_DIR:${LD_LIBRARY_PATH:-}"
 fi
+export GHOSTTY_RESOURCES_DIR="$ROOT_DIR/ghostty/zig-out/share/ghostty"
+export GHOSTTY_SHELL_INTEGRATION_XDG_DIR="$GHOSTTY_RESOURCES_DIR/shell-integration"
+export TERMINFO="$ROOT_DIR/ghostty/zig-out/share/terminfo"
+
+# Personal shell startup files can consume the native autostart input. Keep
+# the POSIX-shell fixture deterministic without changing the user's home.
+export SHELL=/bin/sh ENV=/dev/null PS1='' PS2=''
+mkdir -p "$XDG_CONFIG_HOME/ghostty"
+printf 'command = /bin/sh\n' > "$XDG_CONFIG_HOME/ghostty/config"
 
 # --- 3. Stage 0: dry-run agent-team (no host) ----------------------------
 # Fast sanity pass — if this fails nothing else will work.
@@ -81,11 +178,7 @@ export LIMUX_SOCKET="$SOCKET"
 export LIMUX_SOCKET_PATH="$SOCKET"
 export LIMUX_SOCKET_MODE="runtime"
 unset LIMUX_PANE_ID LIMUX_SURFACE_ID LIMUX_TAB_ID LIMUX_WORKSPACE_ID
-export XDG_DATA_HOME="$DEMO_DIR/data"
-export XDG_STATE_HOME="$DEMO_DIR/state"
-export XDG_RUNTIME_DIR="$DEMO_DIR/runtime"
-mkdir -p "$XDG_DATA_HOME/limux" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
-chmod 700 "$XDG_RUNTIME_DIR"
+mkdir -p "$DEMO_DIR/autostart-cwd"
 cat > "$XDG_DATA_HOME/limux/session.json" <<SMOKE_SESSION
 {
   "version": 1,
@@ -99,6 +192,7 @@ cat > "$XDG_DATA_HOME/limux/session.json" <<SMOKE_SESSION
       "favorite": false,
       "cwd": "$DEMO_DIR",
       "folder_path": "$DEMO_DIR",
+      "autostart_command": "cd $DEMO_DIR/autostart-cwd; export LIMUX_AUTOSTART_STATE=preserved; echo native-autostart-visible; if [ -t 0 ] && [ -t 1 ]; then printf native-autostart-pty > $DEMO_DIR/autostart-proof; fi",
       "layout": {
         "kind": "pane",
         "pane_id": 1,
@@ -120,17 +214,27 @@ SMOKE_SESSION
 
 echo
 echo "== stage 1: boot limux host under headless Weston =="
-export LIBGL_ALWAYS_SOFTWARE=1
-export GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}"
-export LP_NUM_THREADS=1
+WESTON_RENDERER_ARGS=()
+if [ "$GRAPHICS" = hardware ]; then
+  unset LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER LP_NUM_THREADS
+  WESTON_RENDERER_ARGS=(--use-gl)
+  export GDK_DEBUG="${GDK_DEBUG:+$GDK_DEBUG,}opengl"
+else
+  export LIBGL_ALWAYS_SOFTWARE=1
+  export GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}"
+  export LP_NUM_THREADS=1
+fi
 export GDK_BACKEND=wayland
 export WAYLAND_DISPLAY=wayland-limux-smoke
+unset DISPLAY
 HOST_PID=""
 WESTON_PID=""
 
 start_compositor() {
   setsid weston \
     --backend=headless-backend.so \
+    --no-config \
+    "${WESTON_RENDERER_ARGS[@]}" \
     --socket="$WAYLAND_DISPLAY" \
     --idle-time=0 \
     --width=1280 \
@@ -224,19 +328,32 @@ wait_for_healthy_surfaces() {
 }
 
 host_child_count() {
-  awk '{ count += NF } END { print count + 0 }' /proc/"$HOST_PID"/task/*/children
+  local count
+  # A thread can exit after glob expansion. Do not emit a partial scan's count.
+  if count="$(awk '{ count += NF } END { print count + 0 }' /proc/"$HOST_PID"/task/*/children 2>/dev/null)"; then
+    printf '%s\n' "$count"
+    return 0
+  fi
+  return 1
 }
 
 wait_for_host_child_count() {
-  local expected="$1"
+  local expected="${1:-}" count last_count=unavailable
   for _ in $(seq 1 100); do
-    if [ "$(host_child_count)" -eq "$expected" ]; then
-      return 0
+    if count="$(host_child_count)"; then
+      last_count="$count"
+      if [ -z "$expected" ]; then
+        printf '%s\n' "$count"
+        return 0
+      fi
+      if [ "$count" -eq "$expected" ]; then
+        return 0
+      fi
     fi
     sleep 0.1
   done
 
-  echo "FAIL: host child count is $(host_child_count), expected $expected"
+  echo "FAIL: host $HOST_PID child count: last complete=$last_count, expected=${expected:-readable}" >&2
   return 1
 }
 
@@ -257,20 +374,134 @@ cleanup() {
       echo "-- $log (tail) --"
       tail -n 40 "$log" || true
     done
-    echo "artifacts retained at: $DEMO_DIR"
-  else
-    # Clean slate on success.
-    rm -rf "$DEMO_DIR"
   fi
 }
 trap cleanup EXIT INT TERM
 
 start_compositor
+cargo test --locked $CARGO_FLAGS -p limux-host-linux shutdown_uses_the_terminal_gl_context \
+  -- --ignored --test-threads=1 --nocapture >"$LOG_DIR/terminal-gl-context.txt" 2>&1 \
+  || { cat "$LOG_DIR/terminal-gl-context.txt"; exit 1; }
+cat "$LOG_DIR/terminal-gl-context.txt"
+timeout -k 5s 30s cargo test --locked $CARGO_FLAGS -p limux-host-linux shutdown_with_pending_terminal_messages \
+  -- --ignored --test-threads=1 --nocapture >"$LOG_DIR/terminal-shutdown-backpressure.txt" 2>&1 \
+  || { cat "$LOG_DIR/terminal-shutdown-backpressure.txt"; exit 1; }
+if [ "$GRAPHICS" = hardware ] && ! grep -Fq 'terminal GL: ' "$LOG_DIR/terminal-gl-context.txt"; then
+  echo "FAIL: hardware regression did not report its terminal GL context"
+  exit 1
+fi
+for regression in \
+  pane::tab_overflow_tests::overflowing_tabs_bound_terminal_geometry_and_reveal_selection \
+  pane::activity_tests::real_pty_output_drives_tab_activity_lifecycle \
+  terminal::ssh_notification_tests::detached_agent_hook_notifies_only_its_originating_terminal \
+  terminal::ssh_notification_tests::linked_tmux_sessions_keep_the_originating_notification_client \
+  ssh_helpers::tests::helper_transfer_configures_only_selected_agent_and_keeps_backup \
+  pane::ssh_reconnect_tests::image_paste_follows_moves_and_cancels_on_reconnect \
+  pane::ssh_reconnect_tests::local_image_paste_inserts_one_private_path \
+  pane::ssh_reconnect_tests::reconnect_and_deferred_tab_moves_keep_one_current_widget \
+  pane::tests::moved_tab_survives_either_pane_closing_before_the_next_frame \
+  pane::tests::retired_pane_releases_its_tab_contents_after_a_frame \
+  pane::tests::closing_the_active_tab_maps_only_its_replacement \
+  pane::tests::moved_terminal_hover_focus_reads_its_new_pane_and_spares_renames \
+  split_tree::tests::split_ratio_callbacks_release_unmapped_paned \
+  split_tree::tests::restoring_split_respects_nested_pane_minimums \
+  settings_editor::tests::interface_controls_restore_effective_values_after_save_failure \
+  settings_editor::tests::hook_controls_restore_effective_values_after_save_failure \
+  settings_editor::tests::hook_rows_show_socket_changes_without_saving_them_again \
+  settings_editor::tests::hooks_is_the_second_settings_tab \
+  window::tests::hidden_workspace_path_does_not_reserve_sidebar_row_height \
+  terminal::tests::submenu_popovers_never_grab \
+  terminal::tests::clipboard_toast_never_retains_its_terminal \
+  terminal::tests::repeated_copies_show_a_single_clipboard_toast \
+  terminal::tests::context_menu_never_retains_its_terminal \
+  terminal::tests::context_menu_the_compositor_refuses_is_detached \
+  terminal::tests::detach_after_repaint_waits_for_a_frame_without_the_widget \
+  window::pane_create_tests::pane_create_replies_once_the_new_pane_can_be_targeted \
+  window::pane_close_tests::closed_tabs_panes_and_workspaces_free_their_widgets \
+  window::pane_close_tests::tab_unread_changes_preserve_independent_workspace_notifications \
+  window::session_save_tests::close_during_pending_save_persists_the_latest_snapshot \
+  window::sidebar_group_tests::empty_saved_session_restores_group_headers_and_metadata \
+  window::eager_restore_tests::eager_restore_starts_surviving_tabs_after_an_earlier_workspace_closes \
+  window::eager_restore_tests::eager_restore_follows_moved_tabs_and_skips_closed_tabs_after_reordering \
+  window::gui_hook_tests::gui_actions_run_their_hooks_and_socket_requests_do_not \
+  window::gui_hooks::tests::failed_hook_child_reports_the_event_and_exit_status \
+  window::pane_close_tests::zoom_and_split_within_a_frame_of_a_close_skip_the_closed_pane \
+  window::pane_close_tests::workspace_context_menu_never_retains_its_popover \
+  pane::tests::moved_browser_tab_reports_to_its_new_pane \
+  window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted \
+  window::ssh_launch_tests::persistent_ssh_restores_retries_moves_and_closes \
+  window::tab_move_tests::moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique \
+  window::tab_move_tests::a_tab_moved_to_another_workspace_answers_to_its_original_ids \
+  window::tab_move_tests::an_unscoped_surface_hint_is_resolved_once_across_workspaces \
+  window::tab_move_tests::a_surface_hidden_by_a_zoom_is_reported_not_found; do
+  timeout -k 5s 30s cargo test --locked $CARGO_FLAGS -p limux-host-linux "$regression" \
+    -- --exact --ignored --test-threads=1 --nocapture
+done
+
+# Weston headless has no active input seat. Exercise the active-window focus
+# and native terminal focus-reporting contracts under isolated X11.
+command -v xvfb-run >/dev/null || {
+  echo "FAIL: xvfb-run is required for the GTK focus regressions"
+  exit 2
+}
+command -v xdotool >/dev/null || {
+  echo "FAIL: xdotool is required for the SSH reconnect keyboard regression"
+  exit 2
+}
+for regression in \
+  window::pane_close_tests::inline_rename_commit_returns_the_focus_to_the_workspace \
+  window::pane_close_tests::passive_rename_focus_restore_preserves_manual_tab_unread \
+  pane::ssh_reconnect_tests::reconnect_preserves_neighbor_keyboard_focus_and_restores_its_own \
+  window::eager_restore_tests::eager_restore_preserves_live_selection_focus_and_agent_bindings; do
+  echo "== regression: $regression under isolated X11 =="
+  regression_log="$LOG_DIR/${regression##*::}-x11.txt"
+  timeout -k 5s 30s xvfb-run -a -s '-screen 0 1440x1000x24 -nolisten tcp' \
+    env -u WAYLAND_DISPLAY GDK_BACKEND=x11 G_DEBUG=fatal-criticals \
+    cargo test --locked $CARGO_FLAGS -p limux-host-linux "$regression" \
+      -- --exact --ignored --test-threads=1 --nocapture \
+    >"$regression_log" 2>&1 \
+    || { cat "$regression_log"; exit 1; }
+  cat "$regression_log"
+done
+
 start_host host
 
 echo
 echo "== stage 1b: terminal surface health and screen I/O =="
 wait_for_healthy_surfaces limux "$LOG_DIR/stage1-health.json"
+
+for _ in $(seq 1 50); do
+  [ -f "$DEMO_DIR/autostart-proof" ] && break
+  sleep 0.1
+done
+[ "$(cat "$DEMO_DIR/autostart-proof" 2>/dev/null)" = "native-autostart-pty" ] \
+  || { echo "FAIL: native workspace autostart did not receive a terminal PTY"; exit 1; }
+if find "$XDG_RUNTIME_DIR/limux" -maxdepth 1 -name 'workspace-autostart-*.sh' -print -quit \
+  | grep -q .; then
+  echo "FAIL: workspace autostart script was not removed after launch"
+  exit 1
+fi
+"$LIMUX_CLI" read-screen --workspace limux --scrollback \
+  >"$LOG_DIR/stage1-autostart-screen.txt"
+[ "$(grep -Fxc "native-autostart-visible" "$LOG_DIR/stage1-autostart-screen.txt")" -eq 1 ] \
+  || { echo "FAIL: workspace autostart output was missing or duplicated"; exit 1; }
+! grep -Fq "echo native-autostart-visible" "$LOG_DIR/stage1-autostart-screen.txt" \
+  || { echo "FAIL: workspace autostart command was visibly typed into the terminal"; exit 1; }
+echo "native workspace autostart: OK"
+
+SHELL_STATE_COMMAND="printf '%s|%s' \"\$PWD\" \"\$LIMUX_AUTOSTART_STATE\" > '$DEMO_DIR/autostart-shell-state'"
+"$LIMUX_CLI" send --workspace limux "$SHELL_STATE_COMMAND" \
+  >"$LOG_DIR/stage1-autostart-state-send.txt"
+"$LIMUX_CLI" send-key --workspace limux Enter \
+  >"$LOG_DIR/stage1-autostart-state-enter.txt"
+for _ in $(seq 1 50); do
+  [ -f "$DEMO_DIR/autostart-shell-state" ] && break
+  sleep 0.1
+done
+[ "$(cat "$DEMO_DIR/autostart-shell-state" 2>/dev/null)" \
+    = "$DEMO_DIR/autostart-cwd|preserved" ] \
+  || { echo "FAIL: workspace autostart did not preserve parent-shell state"; exit 1; }
+echo "native workspace autostart shell state: OK"
 
 SCREEN_PROOF="limux-screen-proof-$$"
 SCREEN_COMMAND="clear; printf '%s\\n' '$SCREEN_PROOF'; printf screen-ok > '$DEMO_DIR/screen-command-proof'"
@@ -306,8 +537,8 @@ echo "stage 1b: OK (surface realized, terminal I/O and key levels verified)"
 
 echo
 echo "== stage 1c: terminal teardown releases workspace processes =="
-BASELINE_CHILDREN="$(host_child_count)"
-for cycle in $(seq 1 10); do
+BASELINE_CHILDREN="$(wait_for_host_child_count)"
+for cycle in $(seq 1 "$CYCLES"); do
   "$LIMUX_CLI" --json new-workspace --cwd "$DEMO_DIR" \
     >"$LOG_DIR/stage1c-workspace-$cycle.json"
   TEARDOWN_WORKSPACE="$(jq -r '.workspace_ref' "$LOG_DIR/stage1c-workspace-$cycle.json")"
@@ -317,22 +548,39 @@ for cycle in $(seq 1 10); do
 
   "$LIMUX_CLI" --json new-pane --workspace "$TEARDOWN_WORKSPACE" --direction right \
     >"$LOG_DIR/stage1c-pane-$cycle-1.json"
+  # Use a clean shell so Ctrl+D is EOF regardless of personal key bindings.
   "$LIMUX_CLI" --json new-pane --workspace "$TEARDOWN_WORKSPACE" --direction down \
+    --command "exec /bin/bash --noprofile --norc" \
     >"$LOG_DIR/stage1c-pane-$cycle-2.json"
   wait_for_host_child_count "$((BASELINE_CHILDREN + 3))"
 
   EXIT_SURFACE="$(jq -r '.surface_ref' "$LOG_DIR/stage1c-pane-$cycle-2.json")"
-  "$LIMUX_CLI" send --workspace "$TEARDOWN_WORKSPACE" --surface "$EXIT_SURFACE" exit \
-    >"$LOG_DIR/stage1c-exit-$cycle.txt"
+  wait_for_healthy_surfaces "$TEARDOWN_WORKSPACE" "$LOG_DIR/stage1c-health-before-$cycle.json"
+  # A realized renderer does not imply that the shell has reached its prompt.
+  READY_FILE="$DEMO_DIR/ctrl-d-ready-$cycle"
+  "$LIMUX_CLI" send --workspace "$TEARDOWN_WORKSPACE" --surface "$EXIT_SURFACE" \
+    "printf ready > '$READY_FILE'" >"$LOG_DIR/stage1c-ready-send-$cycle.txt"
   "$LIMUX_CLI" send-key --workspace "$TEARDOWN_WORKSPACE" --surface "$EXIT_SURFACE" Enter \
-    >"$LOG_DIR/stage1c-exit-enter-$cycle.txt"
+    >"$LOG_DIR/stage1c-ready-enter-$cycle.txt"
+  for _ in $(seq 1 50); do
+    [ -f "$READY_FILE" ] && break
+    sleep 0.1
+  done
+  [ -f "$READY_FILE" ] || { echo "FAIL: Ctrl+D shell did not become ready"; exit 1; }
+  "$LIMUX_CLI" send-key --workspace "$TEARDOWN_WORKSPACE" --surface "$EXIT_SURFACE" '<Ctrl>d' \
+    >"$LOG_DIR/stage1c-ctrl-d-$cycle.txt"
   wait_for_host_child_count "$((BASELINE_CHILDREN + 2))"
+  wait_for_healthy_surfaces "$TEARDOWN_WORKSPACE" "$LOG_DIR/stage1c-health-after-$cycle.json"
+  jq -e --arg closed "$EXIT_SURFACE" '
+    .surfaces | length == 2 and all(.[]; .surface_ref != $closed)
+  ' "$LOG_DIR/stage1c-health-after-$cycle.json" >/dev/null \
+    || { echo "FAIL: Ctrl+D did not close only its terminal"; exit 1; }
 
   "$LIMUX_CLI" close-workspace --workspace "$TEARDOWN_WORKSPACE" \
     >"$LOG_DIR/stage1c-close-$cycle.txt"
   wait_for_host_child_count "$BASELINE_CHILDREN"
 done
-echo "stage 1c: OK (10 multi-pane workspace cycles returned to $BASELINE_CHILDREN child process)"
+echo "stage 1c: OK ($CYCLES multi-pane workspace cycles returned to $BASELINE_CHILDREN child process)"
 
 # --- 5. Stage 2: live agent-team ------------------------------------------
 echo
@@ -457,6 +705,279 @@ ENV_SURFACE="$(sed -n '3p' "$SELF_SPLIT_ENV")"
 }
 echo "stage 6: OK (self-split command ran with fresh LIMUX_* env)"
 
+# Keep text, key, and screen operations on the newly focused split, even when
+# the caller has no explicit surface. The first pane must not receive Enter.
+echo
+echo "== stage 6b: consistent terminal control targets =="
+ROUTING_PROOF="$DEMO_DIR/routing-proof"
+ROUTING_COMMAND="printf '%s' \"\$LIMUX_SURFACE_ID\" > '$ROUTING_PROOF'; printf 'routing-visible\\n'"
+"$LIMUX_CLI" --json --id-format both send --workspace limux "$ROUTING_COMMAND" >"$LOG_DIR/stage6b-send.json"
+"$LIMUX_CLI" --json --id-format both send-key --workspace limux Enter >"$LOG_DIR/stage6b-key.json"
+for _ in $(seq 1 50); do
+  [ -f "$ROUTING_PROOF" ] && break
+  sleep 0.1
+done
+[ -f "$ROUTING_PROOF" ] && [ "$(cat "$ROUTING_PROOF")" = "$RESPONSE_SURFACE" ] \
+  || { echo "FAIL: implicit send and Enter did not execute in the focused split"; exit 1; }
+for _ in $(seq 1 50); do
+  "$LIMUX_CLI" --json --id-format both read-screen --workspace limux >"$LOG_DIR/stage6b-read.json"
+  jq -e '.text | contains("routing-visible")' "$LOG_DIR/stage6b-read.json" >/dev/null && break
+  sleep 0.1
+done
+for operation in send key read; do
+  jq -e --arg surface "$RESPONSE_SURFACE" '.surface_id == $surface' \
+    "$LOG_DIR/stage6b-$operation.json" >/dev/null \
+    || { echo "FAIL: $operation targeted a different surface from the focused split"; exit 1; }
+done
+jq -e '.text | contains("routing-visible")' "$LOG_DIR/stage6b-read.json" >/dev/null \
+  || { echo "FAIL: focused terminal output was not readable"; exit 1; }
+
+# An explicit invalid target must fail instead of falling back to focus.
+for operation in send send-key read-screen; do
+  case "$operation" in
+    send) routing_args=("should-not-be-sent") ;;
+    send-key) routing_args=(Enter) ;;
+    read-screen) routing_args=() ;;
+  esac
+  if "$LIMUX_CLI" "$operation" --workspace limux --surface missing-surface \
+      "${routing_args[@]}" >"$LOG_DIR/stage6b-invalid-$operation.txt" 2>&1; then
+    echo "FAIL: $operation accepted a missing explicit surface"
+    exit 1
+  fi
+done
+# Focusing another workspace must not redirect an explicitly scoped request.
+"$LIMUX_CLI" --json --id-format both new-workspace --cwd "$DEMO_DIR" >"$LOG_DIR/stage6b-other-workspace.json"
+OTHER_WORKSPACE="$(jq -r '.workspace_id' "$LOG_DIR/stage6b-other-workspace.json")"
+"$LIMUX_CLI" select-workspace --workspace "$OTHER_WORKSPACE" >"$LOG_DIR/stage6b-other-select.txt"
+"$LIMUX_CLI" --json --id-format both send --workspace limux : >"$LOG_DIR/stage6b-background-send.json"
+"$LIMUX_CLI" --json --id-format both send-key --workspace limux Enter >"$LOG_DIR/stage6b-background-key.json"
+"$LIMUX_CLI" --json --id-format both read-screen --workspace limux >"$LOG_DIR/stage6b-background-read.json"
+BACKGROUND_SURFACE="$(jq -r '.surface_id' "$LOG_DIR/stage6b-background-send.json")"
+for operation in send key read; do
+  jq -e --arg workspace "$WORKSPACE_ID" --arg surface "$BACKGROUND_SURFACE" \
+    '.workspace_id == $workspace and .surface_id == $surface' \
+    "$LOG_DIR/stage6b-background-$operation.json" >/dev/null \
+    || { echo "FAIL: background $operation escaped the requested workspace"; exit 1; }
+done
+if "$LIMUX_CLI" send-key --workspace "$OTHER_WORKSPACE" --surface "$BACKGROUND_SURFACE" Enter \
+    >"$LOG_DIR/stage6b-foreign-surface.txt" 2>&1; then
+  echo "FAIL: explicit surface from another workspace was accepted"
+  exit 1
+fi
+echo "stage 6b: OK (text, Enter, and screen read share the focused target)"
+
+echo
+echo "== stage 6c: surface lifecycle, exact focus, and persistence =="
+wait_for_surface_focus() {
+  local surface="$1" stable=0
+  for _ in $(seq 1 60); do
+    "$LIMUX_CLI" --json --id-format both list-panels --workspace limux >"$LOG_DIR/stage6c-focus.json"
+    if jq -e --arg surface "$surface" '.surfaces | any(.surface_id == $surface and .focused)' \
+        "$LOG_DIR/stage6c-focus.json" >/dev/null; then
+      stable=$((stable + 1))
+      [ "$stable" -ge 3 ] && return 0
+    else
+      stable=0
+    fi
+    sleep 0.1
+  done
+  echo "FAIL: focus did not stay on requested surface $surface"
+  return 1
+}
+
+wait_for_saved_tab() {
+  local surface="$1" predicate="$2" tab="${1#*:}"
+  for _ in $(seq 1 60); do
+    if jq -e --arg tab "$tab" "$predicate" "$XDG_DATA_HOME/limux/session.json" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "FAIL: session did not persist requested state for $surface"
+  return 1
+}
+
+# Each route must select a background workspace and retain its non-first pane.
+for operation in pane surface tab; do
+  "$LIMUX_CLI" select-workspace --workspace "$OTHER_WORKSPACE" >"$LOG_DIR/stage6c-background-$operation.txt"
+  case "$operation" in
+    pane)
+      request="$(jq -nc --arg ws "$WORKSPACE_ID" --argjson pane "$RESPONSE_PANE" \
+        '{method:"pane.focus",params:{workspace_id:$ws,pane_id:$pane}}')"
+      "$LIMUX_CLI" --request "$request" >"$LOG_DIR/stage6c-pane-focus.json" ;;
+    surface)
+      "$LIMUX_CLI" focus-surface --workspace limux --surface "$RESPONSE_SURFACE" >"$LOG_DIR/stage6c-surface-focus.txt" ;;
+    tab)
+      "$LIMUX_CLI" tab-action --workspace limux --tab "$RESPONSE_SURFACE" --action focus >"$LOG_DIR/stage6c-tab-focus.txt" ;;
+  esac
+  wait_for_surface_focus "$RESPONSE_SURFACE"
+done
+
+# Invalid explicit targets must not close, focus, or create anything elsewhere.
+for request in \
+    '{"method":"surface.close","params":{"workspace_id":"limux","surface_id":[]}}' \
+    "$(jq -nc --arg ws "$OTHER_WORKSPACE" --arg surface "$RESPONSE_SURFACE" \
+      '{method:"surface.close",params:{workspace_id:$ws,surface_id:$surface}}')" \
+    "$(jq -nc --arg ws "$OTHER_WORKSPACE" --argjson pane "$RESPONSE_PANE" \
+      '{method:"surface.create",params:{workspace_id:$ws,pane_id:$pane}}')" \
+    "$(jq -nc --arg ws "$OTHER_WORKSPACE" --argjson pane "$RESPONSE_PANE" \
+      '{method:"pane.focus",params:{workspace_id:$ws,pane_id:$pane}}')"; do
+  if "$LIMUX_CLI" --request "$request" >>"$LOG_DIR/stage6c-invalid.txt" 2>&1; then
+    echo "FAIL: lifecycle operation accepted an invalid or foreign explicit target"
+    exit 1
+  fi
+done
+wait_for_surface_focus "$RESPONSE_SURFACE"
+
+# An untargeted new tab belongs in the focused split, not the first pane.
+"$LIMUX_CLI" --json --id-format both new-surface --workspace limux >"$LOG_DIR/stage6c-new.json"
+LIFECYCLE_SURFACE="$(jq -r '.surface_id' "$LOG_DIR/stage6c-new.json")"
+[[ "$LIFECYCLE_SURFACE" == "$RESPONSE_PANE:"* ]] \
+  || { echo "FAIL: new-surface did not use the focused pane"; exit 1; }
+wait_for_healthy_surfaces limux "$LOG_DIR/stage6c-health.json"
+wait_for_surface_focus "$LIFECYCLE_SURFACE"
+SAVED_SELECTION='[.. | objects | select(.active_tab_id? == $tab)] | length == 1'
+wait_for_saved_tab "$LIFECYCLE_SURFACE" "$SAVED_SELECTION"
+"$LIMUX_CLI" focus-surface --workspace limux --surface "$RESPONSE_SURFACE" >"$LOG_DIR/stage6c-select-original.txt"
+wait_for_saved_tab "$RESPONSE_SURFACE" "$SAVED_SELECTION"
+"$LIMUX_CLI" tab-action --workspace limux --tab "$LIFECYCLE_SURFACE" --action select >"$LOG_DIR/stage6c-select-new.txt"
+wait_for_saved_tab "$LIFECYCLE_SURFACE" "$SAVED_SELECTION"
+"$LIMUX_CLI" tab-action --workspace limux --tab "$RESPONSE_SURFACE" --action activate >"$LOG_DIR/stage6c-activate-original.txt"
+wait_for_saved_tab "$RESPONSE_SURFACE" "$SAVED_SELECTION"
+"$LIMUX_CLI" focus-surface --workspace limux --surface "$LIFECYCLE_SURFACE" >"$LOG_DIR/stage6c-focus-new.txt"
+wait_for_surface_focus "$LIFECYCLE_SURFACE"
+
+# Explicit workspace scope must not inherit an unrelated caller tab from the environment.
+LIMUX_TAB_ID=foreign-tab "$LIMUX_CLI" rename-tab --workspace limux lifecycle-renamed >"$LOG_DIR/stage6c-rename.txt"
+wait_for_saved_tab "$LIFECYCLE_SURFACE" '[.. | objects | select(.id? == $tab and .custom_name? == "lifecycle-renamed")] | length == 1'
+LIMUX_TAB_ID=foreign-tab "$LIMUX_CLI" --json --id-format both tab-action --workspace limux --action pin >"$LOG_DIR/stage6c-pin.json"
+PINNED_TAB_REF="$(jq -r '.tab_ref' "$LOG_DIR/stage6c-pin.json")"
+jq -e --arg surface "$LIFECYCLE_SURFACE" --arg tab "${LIFECYCLE_SURFACE#*:}" \
+  '.surface_id == $surface and .tab_id == $tab and .tab_ref == ("tab:" + $tab)' \
+  "$LOG_DIR/stage6c-pin.json" >/dev/null \
+  || { echo "FAIL: tab-action returned an incorrect implicit-target handle"; exit 1; }
+wait_for_saved_tab "$LIFECYCLE_SURFACE" '[.. | objects | select(.id? == $tab and .pinned? == true)] | length == 1'
+if "$LIMUX_CLI" close-surface --workspace limux --surface "$LIFECYCLE_SURFACE" >"$LOG_DIR/stage6c-pinned-close.txt" 2>&1; then
+  echo "FAIL: close-surface closed a pinned tab"
+  exit 1
+fi
+"$LIMUX_CLI" tab-action --workspace limux --tab "$PINNED_TAB_REF" --action unpin >"$LOG_DIR/stage6c-unpin.txt"
+"$LIMUX_CLI" tab-action --workspace limux --tab "$LIFECYCLE_SURFACE" --action rename --title '' >"$LOG_DIR/stage6c-clear-title.txt"
+wait_for_saved_tab "$LIFECYCLE_SURFACE" '[.. | objects | select(.id? == $tab and .pinned? == false and .custom_name? == null)] | length == 1'
+"$LIMUX_CLI" --json --id-format both list-panels --workspace limux >"$LOG_DIR/stage6c-renamed-panels.json"
+jq -e --arg surface "$LIFECYCLE_SURFACE" '.surfaces | any(.surface_id == $surface and .title != "lifecycle-renamed" and .title != "")' \
+  "$LOG_DIR/stage6c-renamed-panels.json" >/dev/null \
+  || { echo "FAIL: clearing the custom name left a stale label"; exit 1; }
+"$LIMUX_CLI" close-surface --workspace limux --surface "$LIFECYCLE_SURFACE" >"$LOG_DIR/stage6c-close.txt"
+
+# about:blank may never emit a later navigation callback. Creation must save it.
+"$LIMUX_CLI" --json --id-format both new-surface --workspace limux --pane "$RESPONSE_PANE" \
+  --type browser --url about:blank >"$LOG_DIR/stage6c-browser.json"
+BROWSER_SURFACE="$(jq -r '.surface_id' "$LOG_DIR/stage6c-browser.json")"
+wait_for_saved_tab "$BROWSER_SURFACE" '[.. | objects | select(.id? == $tab and .tab_kind? == "browser" and .uri? == "about:blank")] | length == 1'
+"$LIMUX_CLI" close-surface --workspace limux --surface "$BROWSER_SURFACE" >"$LOG_DIR/stage6c-browser-close.txt"
+
+# Exercise the production color bridge, including explicit and inherited scope.
+for color in red orange amber green teal blue purple pink none; do
+  "$LIMUX_CLI" set-workspace-color --workspace "$WORKSPACE_ID" "$color"
+  "$LIMUX_CLI" --json --id-format both list-workspaces >"$LOG_DIR/stage6c-colors.json"
+  jq -e --arg workspace "$WORKSPACE_ID" --arg color "$color" \
+    '.workspaces | any(.workspace_id == $workspace and .color == (if $color == "none" then null else $color end))' \
+    "$LOG_DIR/stage6c-colors.json" >/dev/null \
+    || { echo "FAIL: workspace color $color was not applied"; exit 1; }
+done
+if "$LIMUX_CLI" set-workspace-color --workspace "$WORKSPACE_ID" chartreuse \
+    >"$LOG_DIR/stage6c-invalid-color.txt" 2>&1; then
+  echo "FAIL: unsupported workspace color was accepted"
+  exit 1
+fi
+"$LIMUX_CLI" select-workspace --workspace "$OTHER_WORKSPACE"
+LIMUX_WORKSPACE_ID="$WORKSPACE_ID" "$LIMUX_CLI" set-workspace-color blue
+"$LIMUX_CLI" --json --id-format both list-workspaces >"$LOG_DIR/stage6c-color-env.json"
+jq -e --arg workspace "$WORKSPACE_ID" \
+  '.workspaces | any(.workspace_id == $workspace and .color == "blue")' \
+  "$LOG_DIR/stage6c-color-env.json" >/dev/null \
+  || { echo "FAIL: workspace color ignored LIMUX_WORKSPACE_ID"; exit 1; }
+LIMUX_WORKSPACE_ID="$OTHER_WORKSPACE" "$LIMUX_CLI" set-workspace-color --workspace "$WORKSPACE_ID" pink
+"$LIMUX_CLI" --json --id-format both list-workspaces >"$LOG_DIR/stage6c-color-scope.json"
+jq -e --arg workspace "$WORKSPACE_ID" --arg other "$OTHER_WORKSPACE" \
+  '(.workspaces | any(.workspace_id == $workspace and .color == "pink")) and (.workspaces | any(.workspace_id == $other and .color == null))' \
+  "$LOG_DIR/stage6c-color-scope.json" >/dev/null \
+  || { echo "FAIL: workspace color escaped the requested scope"; exit 1; }
+# Exercise sidebar workspace groups: membership, collapse, and the guard
+# that keeps a group with workspaces from being deleted.
+"$LIMUX_CLI" --json --id-format both create-group --color teal \
+  --workspace "$WORKSPACE_ID" --workspace "$OTHER_WORKSPACE" Smoke >"$LOG_DIR/stage6d-create.json"
+GROUP_ID="$(jq -r '.group_id' "$LOG_DIR/stage6d-create.json")"
+jq -e --arg a "$WORKSPACE_ID" --arg b "$OTHER_WORKSPACE" \
+  '.name == "Smoke" and .color == "teal" and .collapsed == false and .workspace_ids == [$a, $b]' \
+  "$LOG_DIR/stage6d-create.json" >/dev/null \
+  || { echo "FAIL: create-group did not group both workspaces"; exit 1; }
+"$LIMUX_CLI" rename-group --group "group:$GROUP_ID" Smoked
+"$LIMUX_CLI" set-group-color --group Smoked purple
+"$LIMUX_CLI" collapse-group --group "$GROUP_ID"
+"$LIMUX_CLI" --json --id-format both list-groups >"$LOG_DIR/stage6d-list.json"
+jq -e --arg id "$GROUP_ID" \
+  '.groups | any(.group_id == $id and .name == "Smoked" and .color == "purple" and .collapsed == true)' \
+  "$LOG_DIR/stage6d-list.json" >/dev/null \
+  || { echo "FAIL: group rename, color or collapse was not applied"; exit 1; }
+"$LIMUX_CLI" --json --id-format both list-workspaces >"$LOG_DIR/stage6d-workspaces.json"
+jq -e --arg id "$GROUP_ID" --arg a "$WORKSPACE_ID" \
+  '.workspaces | any(.workspace_id == $a and .group_id == $id)' \
+  "$LOG_DIR/stage6d-workspaces.json" >/dev/null \
+  || { echo "FAIL: list-workspaces did not report the group"; exit 1; }
+if "$LIMUX_CLI" delete-group --group "$GROUP_ID" >"$LOG_DIR/stage6d-delete-nonempty.txt" 2>&1; then
+  echo "FAIL: a group with workspaces was deleted"
+  exit 1
+fi
+"$LIMUX_CLI" set-workspace-group --workspace "$OTHER_WORKSPACE" none
+"$LIMUX_CLI" --json --id-format both create-group Empty >"$LOG_DIR/stage6d-empty.json"
+EMPTY_GROUP_ID="$(jq -r '.group_id' "$LOG_DIR/stage6d-empty.json")"
+"$LIMUX_CLI" set-workspace-group --workspace "$WORKSPACE_ID" "$EMPTY_GROUP_ID"
+"$LIMUX_CLI" delete-group --group "$GROUP_ID"
+"$LIMUX_CLI" --json --id-format both list-groups >"$LOG_DIR/stage6d-after-delete.json"
+jq -e --arg empty "$EMPTY_GROUP_ID" --arg a "$WORKSPACE_ID" \
+  '(.groups | length) == 1 and .groups[0].group_id == $empty and .groups[0].workspace_ids == [$a]' \
+  "$LOG_DIR/stage6d-after-delete.json" >/dev/null \
+  || { echo "FAIL: deleting the emptied group left the wrong groups"; exit 1; }
+# Keep the second group, collapsed, for the restart check in stage 8.
+"$LIMUX_CLI" collapse-group --group "$EMPTY_GROUP_ID"
+echo "stage 6d: OK (workspace groups)"
+# GUI hooks: the CLI stores them in settings.json, and socket requests never
+# run them, so closing a workspace below must leave no marker.
+HOOK_MARKER="$LOG_DIR/stage6e-hook-ran"
+"$LIMUX_CLI" gui-hooks set on-workspace-delete --command "touch '$HOOK_MARKER'" --suppress-default
+"$LIMUX_CLI" gui-hooks set after-workspace-delete --command "touch '$HOOK_MARKER'" --show-terminal
+"$LIMUX_CLI" gui-hooks disable on-workspace-create
+if "$LIMUX_CLI" gui-hooks set after-workspace-create --command true --suppress-default \
+  >"$LOG_DIR/stage6e-after-suppress.txt" 2>&1; then
+  echo "FAIL: an after-* hook accepted --suppress-default"
+  exit 1
+fi
+"$LIMUX_CLI" --json gui-hooks list >"$LOG_DIR/stage6e-list.json"
+jq -e '(.hooks | map(.event)) == ["on-workspace-create", "after-workspace-create", "on-workspace-delete", "after-workspace-delete"]
+    and (.hooks | any(.event == "on-workspace-delete" and .configured and .enabled and .suppress_default))
+    and (.hooks | any(.event == "after-workspace-delete" and .configured and .show_terminal and (.can_skip_default | not)))
+    and (.hooks | any(.event == "after-workspace-create" and (.configured | not)))
+    and (.hooks | any(.event == "on-workspace-create" and (.configured | not) and (.enabled | not)))' \
+  "$LOG_DIR/stage6e-list.json" >/dev/null \
+  || { echo "FAIL: gui-hooks list did not report the hooks just set"; exit 1; }
+jq -e '.hooks.on_workspace_delete.suppress_default == true and .hooks.on_workspace_create.enabled == false
+    and .hooks.after_workspace_delete.show_terminal == true and (.hooks | has("after_workspace_create") | not)' \
+  "$XDG_CONFIG_HOME/limux/settings.json" >/dev/null \
+  || { echo "FAIL: gui-hooks were not saved to settings.json"; exit 1; }
+"$LIMUX_CLI" close-workspace --workspace "$OTHER_WORKSPACE" >"$LOG_DIR/stage6c-other-close.txt"
+sleep 0.5
+[ ! -e "$HOOK_MARKER" ] || { echo "FAIL: a socket close-workspace ran the GUI delete hook"; exit 1; }
+"$LIMUX_CLI" gui-hooks clear on-workspace-delete
+"$LIMUX_CLI" gui-hooks clear after-workspace-delete
+"$LIMUX_CLI" gui-hooks clear on-workspace-create
+jq -e 'has("hooks") | not' "$XDG_CONFIG_HOME/limux/settings.json" >/dev/null \
+  || { echo "FAIL: clearing every gui-hook left a hooks key"; exit 1; }
+echo "stage 6e: OK (on-* and after-* gui-hooks set, list and clear; socket requests run no hook)"
+wait_for_healthy_surfaces limux "$LOG_DIR/stage6c-final-health.json"
+echo "stage 6c: OK (scoped lifecycle, background focus, pins, and saved tab selection)"
+
 # --- 10. Stage 7: hook translators end-to-end -----------------------------
 echo
 echo "== stage 7: claude-hook event translation =="
@@ -488,12 +1009,155 @@ start_host host-restart
 "$LIMUX_CLI" list-workspaces >"$LOG_DIR/stage8-workspaces.txt"
 grep -Fq "$RESTORED_WORKSPACE" "$LOG_DIR/stage8-workspaces.txt" \
   || { echo "FAIL: renamed workspace was not restored"; exit 1; }
-"$LIMUX_CLI" --json list-panes --workspace "$RESTORED_WORKSPACE" \
-  >"$LOG_DIR/stage8-panes.json"
+"$LIMUX_CLI" --json --id-format both list-workspaces >"$LOG_DIR/stage8-colors.json"
+jq -e --arg workspace "$WORKSPACE_ID" \
+  '.workspaces | any(.workspace_id == $workspace and .color == "pink")' \
+  "$LOG_DIR/stage8-colors.json" >/dev/null \
+  || { echo "FAIL: workspace color was not restored"; exit 1; }
+"$LIMUX_CLI" --json --id-format both list-groups >"$LOG_DIR/stage8-groups.json"
+jq -e --arg empty "$EMPTY_GROUP_ID" --arg workspace "$WORKSPACE_ID" \
+  '.groups == [.groups[0]] and .groups[0].group_id == $empty and .groups[0].name == "Empty"
+    and .groups[0].collapsed == true and .groups[0].workspace_ids == [$workspace]' \
+  "$LOG_DIR/stage8-groups.json" >/dev/null \
+  || { echo "FAIL: workspace group was not restored"; exit 1; }
+for _ in $(seq 1 50); do
+  "$LIMUX_CLI" --json list-panes --workspace "$RESTORED_WORKSPACE" \
+    >"$LOG_DIR/stage8-panes.json"
+  if jq -e '(.panes | length) == 4' "$LOG_DIR/stage8-panes.json" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
 jq -e '(.panes | length) == 4' "$LOG_DIR/stage8-panes.json" >/dev/null \
   || { echo "FAIL: restored workspace did not retain all panes"; exit 1; }
 wait_for_healthy_surfaces "$RESTORED_WORKSPACE" "$LOG_DIR/stage8-health.json"
 stop_host
+
+# --- 12. Stage 9: explicit non-shell Ghostty commands receive no input -----
+echo
+echo "== stage 9: non-shell Ghostty command suppresses autostart input =="
+mkdir -p "$XDG_CONFIG_HOME/ghostty"
+DIRECT_COMMAND="$DEMO_DIR/direct-command.py"
+cat > "$DIRECT_COMMAND" <<'PY'
+#!/usr/bin/python3
+import pathlib
+import select
+import sys
+import time
+
+root = pathlib.Path(__file__).parent
+(root / "direct-command-started").write_text("started")
+readable, _, _ = select.select([sys.stdin], [], [], 2.0)
+if readable:
+    data = sys.stdin.buffer.read1(4096)
+    if data:
+        (root / "direct-command-input").write_bytes(data)
+time.sleep(30)
+PY
+chmod 700 "$DIRECT_COMMAND"
+printf 'command = direct:%s\n' "$DIRECT_COMMAND" > "$XDG_CONFIG_HOME/ghostty/config.ghostty"
+rm -f "$DEMO_DIR/autostart-proof" "$DEMO_DIR/direct-command-started" \
+  "$DEMO_DIR/direct-command-input"
+cat > "$XDG_DATA_HOME/limux/session.json" <<DIRECT_SESSION
+{
+  "version": 1,
+  "active_workspace_index": 0,
+  "top_bar_visible": true,
+  "sidebar": { "visible": true, "width": 220 },
+  "workspaces": [
+    {
+      "id": "00000000-0000-4000-8000-000000000009",
+      "name": "direct-command",
+      "favorite": false,
+      "cwd": "$DEMO_DIR",
+      "folder_path": "$DEMO_DIR",
+      "autostart_command": "printf should-not-run > $DEMO_DIR/autostart-proof",
+      "layout": {
+        "kind": "pane",
+        "pane_id": 1,
+        "active_tab_id": "terminal-direct",
+        "tabs": [
+          {
+            "id": "terminal-direct",
+            "custom_name": null,
+            "pinned": false,
+            "tab_kind": "terminal",
+            "cwd": "$DEMO_DIR"
+          }
+        ]
+      }
+    }
+  ]
+}
+DIRECT_SESSION
+start_host host-direct-command
+for _ in $(seq 1 50); do
+  [ -f "$DEMO_DIR/direct-command-started" ] && break
+  sleep 0.1
+done
+[ -f "$DEMO_DIR/direct-command-started" ] \
+  || { echo "FAIL: configured direct command did not start"; exit 1; }
+sleep 3
+[ ! -e "$DEMO_DIR/direct-command-input" ] \
+  || { echo "FAIL: configured direct command received injected terminal input"; exit 1; }
+[ ! -e "$DEMO_DIR/autostart-proof" ] \
+  || { echo "FAIL: workspace autostart ran for a configured non-shell command"; exit 1; }
+grep -Fq "skipping workspace autostart for non-shell terminal command" \
+  "$LOG_DIR/host-direct-command.stderr" \
+  || { echo "FAIL: non-shell autostart suppression was not diagnosed"; exit 1; }
+stop_host
+echo "stage 9: OK (config.ghostty direct command started without autostart input)"
+
+# --- 13. Stage 10: shell wrappers with payloads receive no input -----------
+echo
+echo "== stage 10: non-interactive shell wrapper suppresses autostart input =="
+printf "command = shell:/bin/bash -lc 'exec %s'\n" "$DIRECT_COMMAND" \
+  > "$XDG_CONFIG_HOME/ghostty/config.ghostty"
+rm -f "$DEMO_DIR/autostart-proof" "$DEMO_DIR/direct-command-started" \
+  "$DEMO_DIR/direct-command-input"
+start_host host-shell-wrapper
+for _ in $(seq 1 50); do
+  [ -f "$DEMO_DIR/direct-command-started" ] && break
+  sleep 0.1
+done
+[ -f "$DEMO_DIR/direct-command-started" ] \
+  || { echo "FAIL: configured shell wrapper did not start its command"; exit 1; }
+sleep 3
+[ ! -e "$DEMO_DIR/direct-command-input" ] \
+  || { echo "FAIL: shell-wrapped command received injected terminal input"; exit 1; }
+[ ! -e "$DEMO_DIR/autostart-proof" ] \
+  || { echo "FAIL: workspace autostart ran for a non-interactive shell wrapper"; exit 1; }
+grep -Fq "skipping workspace autostart for non-shell terminal command" \
+  "$LOG_DIR/host-shell-wrapper.stderr" \
+  || { echo "FAIL: shell-wrapper autostart suppression was not diagnosed"; exit 1; }
+stop_host
+echo "stage 10: OK (shell-wrapped command started without autostart input)"
+
+# --- 14. Stage 11: first-surface initial-command receives no input --------
+echo
+echo "== stage 11: non-shell initial-command suppresses autostart input =="
+printf 'command = direct:/bin/bash\ninitial-command = direct:%s\n' "$DIRECT_COMMAND" \
+  > "$XDG_CONFIG_HOME/ghostty/config.ghostty"
+rm -f "$DEMO_DIR/autostart-proof" "$DEMO_DIR/direct-command-started" \
+  "$DEMO_DIR/direct-command-input"
+start_host host-initial-command
+for _ in $(seq 1 50); do
+  [ -f "$DEMO_DIR/direct-command-started" ] && break
+  sleep 0.1
+done
+[ -f "$DEMO_DIR/direct-command-started" ] \
+  || { echo "FAIL: configured initial-command did not start"; exit 1; }
+sleep 3
+[ ! -e "$DEMO_DIR/direct-command-input" ] \
+  || { echo "FAIL: configured initial-command received injected terminal input"; exit 1; }
+[ ! -e "$DEMO_DIR/autostart-proof" ] \
+  || { echo "FAIL: workspace autostart ran for a configured non-shell initial-command"; exit 1; }
+grep -Fq "skipping workspace autostart for non-shell terminal command" \
+  "$LOG_DIR/host-initial-command.stderr" \
+  || { echo "FAIL: initial-command autostart suppression was not diagnosed"; exit 1; }
+stop_host
+echo "stage 11: OK (initial-command started without autostart input)"
+
 kill -TERM -- "-$WESTON_PID"
 for _ in $(seq 1 50); do
   if ! kill -0 -- "-$WESTON_PID" 2>/dev/null; then

@@ -5,7 +5,11 @@ use adw::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-use crate::app_config::{AppConfig, ColorScheme, NotificationSound, UiScale, DEFAULT_UI_SCALE};
+use crate::app_config::{
+    AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale, UnreadColor,
+    WindowControlsSide, DEFAULT_UI_SCALE, MAX_TAB_ACTIVITY_SECONDS, MIN_TAB_ACTIVITY_SECONDS,
+};
+use crate::gui_hooks::{GuiHook, GuiHookEvent, GuiHooksConfig};
 use crate::keybind_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
 
@@ -97,7 +101,7 @@ const UI_SCALE_DESCRIPTORS: &[UiScaleDescriptor] = &[
 
 pub fn ui_scale_css(config: &AppConfig) -> String {
     let scale = config.appearance.ui_scale.get();
-    UI_SCALE_DESCRIPTORS
+    let mut rules: Vec<String> = UI_SCALE_DESCRIPTORS
         .iter()
         .map(|descriptor| {
             format!(
@@ -107,8 +111,15 @@ pub fn ui_scale_css(config: &AppConfig) -> String {
                 descriptor.base_size * scale
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    let c = config.appearance.unread_color.css_color();
+    rules.push(format!(
+        ".limux-indicator-unread-dot, .limux-notify-dot, .limux-tab-unread-dot {{ color: {c}; }}\n\
+         .limux-notify-msg-unread {{ color: alpha({c}, 0.9); }}\n\
+         .limux-sidebar-row-unread {{ background-color: alpha({c}, 0.14); border-left: 3px solid {c}; }}\n\
+         .limux-sidebar-list row:selected .limux-sidebar-row-box.limux-sidebar-row-unread {{ background: alpha({c}, 0.18); border-left: 3px solid {c}; }}"
+    ));
+    rules.join("\n")
 }
 
 type OnConfigChanged = dyn Fn(&AppConfig, &AppConfig);
@@ -172,6 +183,10 @@ fn build_settings_window_content(window: &adw::Window, input: SettingsEditorInpu
     let general_stack_page = stack.add_titled(&general_page, Some("general"), "General");
     general_stack_page.set_icon_name(Some("preferences-system-symbolic"));
 
+    let hooks_page = build_hooks_page(&input);
+    let hooks_stack_page = stack.add_titled(&hooks_page, Some("hooks"), "Hooks");
+    hooks_stack_page.set_icon_name(Some("system-run-symbolic"));
+
     let notifications_page = build_notifications_page(&input);
     let notifications_stack_page =
         stack.add_titled(&notifications_page, Some("notifications"), "Notifications");
@@ -211,6 +226,217 @@ fn build_settings_window_content(window: &adw::Window, input: SettingsEditorInpu
     outer.append(&header_bar);
     outer.append(&stack);
     outer.upcast()
+}
+
+fn build_hooks_page(input: &SettingsEditorInput) -> gtk::Widget {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Hooks");
+    page.set_name(Some("hooks"));
+    page.set_icon_name(Some("system-run-symbolic"));
+    page.set_hexpand(true);
+    page.set_vexpand(true);
+    page.add(&build_gui_hooks_group(input));
+    page.upcast()
+}
+
+fn build_gui_hooks_group(input: &SettingsEditorInput) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("GUI hooks");
+    group.set_description(Some(
+        "Run a command when you create or delete a workspace from the GUI: \
+         an \"On\" hook runs before Limux does it and can take it over, an \
+         \"After\" hook runs once Limux has done it. A hook that takes the \
+         action over does its own follow-up: requests made through the limux \
+         CLI or socket never run hooks. The command runs in bash with \
+         LIMUX_HOOK, LIMUX_SOCKET, LIMUX_WORKSPACE_NAME and, when known, \
+         LIMUX_WORKSPACE_ID, LIMUX_WORKSPACE_FOLDER, LIMUX_GROUP_ID and \
+         LIMUX_WORKSPACE_COMMAND. Closing a workspace's last tab also runs the \
+         delete hooks, but cannot be skipped.",
+    ));
+    for event in GuiHookEvent::ALL {
+        group.add(&build_gui_hook_row(input, event));
+    }
+    group
+}
+
+fn gui_hook_subtitle(hook: &GuiHook) -> String {
+    match (hook.command.trim(), hook.enabled) {
+        ("", _) => "Not set".to_string(),
+        (command, true) => command.to_string(),
+        (command, false) => format!("Disabled: {command}"),
+    }
+}
+
+/// The widgets of one hook row, so a change made over the socket can be
+/// shown in an open Settings window.
+struct GuiHookRowWidgets {
+    event: GuiHookEvent,
+    expander: gtk::glib::WeakRef<adw::ExpanderRow>,
+    enabled: gtk::glib::WeakRef<gtk::Switch>,
+    command: gtk::glib::WeakRef<gtk::Entry>,
+    show_terminal: gtk::glib::WeakRef<gtk::Switch>,
+    /// `None` for an after-* hook, which cannot skip Limux's action.
+    suppress_default: Option<gtk::glib::WeakRef<gtk::Switch>>,
+}
+
+impl GuiHookRowWidgets {
+    fn show(&self, hook: &GuiHook) -> Option<()> {
+        self.expander
+            .upgrade()?
+            .set_subtitle(&gui_hook_subtitle(hook));
+        self.enabled.upgrade()?.set_active(hook.enabled);
+        let command = self.command.upgrade()?;
+        // Rewriting equal text would move the cursor while the user types.
+        if command.text().trim() != hook.command {
+            command.set_text(&hook.command);
+        }
+        self.show_terminal.upgrade()?.set_active(hook.show_terminal);
+        if let Some(suppress_default) = &self.suppress_default {
+            suppress_default
+                .upgrade()?
+                .set_active(hook.suppress_default);
+        }
+        Some(())
+    }
+}
+
+thread_local! {
+    static GUI_HOOK_ROWS: RefCell<Vec<GuiHookRowWidgets>> = const { RefCell::new(Vec::new()) };
+    static REFRESHING_GUI_HOOK_ROWS: Cell<bool> = const { Cell::new(false) };
+}
+
+struct GuiHookRefreshGuard(bool);
+
+impl GuiHookRefreshGuard {
+    fn new() -> Self {
+        Self(REFRESHING_GUI_HOOK_ROWS.with(|refreshing| refreshing.replace(true)))
+    }
+}
+
+impl Drop for GuiHookRefreshGuard {
+    fn drop(&mut self) {
+        REFRESHING_GUI_HOOK_ROWS.with(|refreshing| refreshing.set(self.0));
+    }
+}
+
+/// Show `hooks` in any open Settings window. The row handlers see that the
+/// config already holds these values, so nothing is saved again. GTK emits
+/// entry changes synchronously while setting text; suppress those callbacks
+/// until every row reflects the effective config.
+pub fn refresh_gui_hook_rows(hooks: &GuiHooksConfig) {
+    let _guard = GuiHookRefreshGuard::new();
+    GUI_HOOK_ROWS.with(|rows| {
+        let mut rows = rows.borrow_mut();
+        rows.retain(|row| row.expander.upgrade().is_some());
+        for row in rows.iter() {
+            row.show(hooks.get(row.event));
+        }
+    });
+}
+
+fn hook_switch_row(title: &str, subtitle: &str, active: bool) -> (adw::ActionRow, gtk::Switch) {
+    let row = adw::ActionRow::builder()
+        .title(title)
+        .subtitle(subtitle)
+        .build();
+    // Wrap the whole explanation rather than cut it off.
+    row.set_subtitle_lines(0);
+    let switch = gtk::Switch::new();
+    switch.set_active(active);
+    switch.set_valign(gtk::Align::Center);
+    row.add_suffix(&switch);
+    row.set_activatable_widget(Some(&switch));
+    (row, switch)
+}
+
+/// Save a change to `event`'s hook, unless the hook already has it.
+fn connect_gui_hook_field<T: PartialEq + 'static>(
+    input: &SettingsEditorInput,
+    event: GuiHookEvent,
+    field: fn(&mut GuiHook) -> &mut T,
+) -> impl Fn(T) + 'static {
+    let config = input.config.clone();
+    let on_changed = input.on_config_changed.clone();
+    move |value: T| {
+        if REFRESHING_GUI_HOOK_ROWS.with(Cell::get) {
+            return;
+        }
+        if *field(config.borrow_mut().hooks.get_mut(event)) == value {
+            return;
+        }
+        let effective = apply_config_change(&config, &*on_changed, move |c| {
+            *field(c.hooks.get_mut(event)) = value;
+        });
+        refresh_gui_hook_rows(&effective.hooks);
+    }
+}
+
+fn build_gui_hook_row(input: &SettingsEditorInput, event: GuiHookEvent) -> adw::ExpanderRow {
+    let hook = input.config.borrow().hooks.get(event).clone();
+    let expander = adw::ExpanderRow::builder()
+        .title(event.title())
+        .subtitle(gui_hook_subtitle(&hook))
+        .build();
+
+    let (enabled_row, enabled_switch) = hook_switch_row(
+        "Enabled",
+        "Turn the hook off without losing its command",
+        hook.enabled,
+    );
+    expander.add_row(&enabled_row);
+
+    let command_row = adw::ActionRow::builder().title("Command").build();
+    let command_entry = gtk::Entry::builder()
+        .text(hook.command.as_str())
+        .placeholder_text("e.g. ~/bin/workspace-hook.sh --force")
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
+    command_row.add_suffix(&command_entry);
+    expander.add_row(&command_row);
+
+    let (terminal_row, terminal_switch) = hook_switch_row(
+        "Show in a terminal",
+        "Run the command in a pop-up terminal you can type into",
+        hook.show_terminal,
+    );
+    expander.add_row(&terminal_row);
+
+    let suppress_switch = event.can_skip_default().then(|| {
+        let (suppress_row, suppress_switch) = hook_switch_row(
+            "Skip the default action",
+            "Let the command create or delete the workspace itself, e.g. with the limux CLI. \
+             Limux's folder prompt is skipped too, and the matching After hook does not run.",
+            hook.suppress_default,
+        );
+        expander.add_row(&suppress_row);
+        suppress_switch
+    });
+
+    let set_enabled = connect_gui_hook_field(input, event, |hook| &mut hook.enabled);
+    enabled_switch.connect_active_notify(move |switch| set_enabled(switch.is_active()));
+    let set_command = connect_gui_hook_field(input, event, |hook| &mut hook.command);
+    command_entry.connect_text_notify(move |entry| set_command(entry.text().trim().to_string()));
+    let set_show_terminal = connect_gui_hook_field(input, event, |hook| &mut hook.show_terminal);
+    terminal_switch.connect_active_notify(move |switch| set_show_terminal(switch.is_active()));
+    if let Some(suppress_switch) = &suppress_switch {
+        let set_suppress_default =
+            connect_gui_hook_field(input, event, |hook| &mut hook.suppress_default);
+        suppress_switch
+            .connect_active_notify(move |switch| set_suppress_default(switch.is_active()));
+    }
+
+    GUI_HOOK_ROWS.with(|rows| {
+        rows.borrow_mut().push(GuiHookRowWidgets {
+            event,
+            expander: expander.downgrade(),
+            enabled: enabled_switch.downgrade(),
+            command: command_entry.downgrade(),
+            show_terminal: terminal_switch.downgrade(),
+            suppress_default: suppress_switch.as_ref().map(|switch| switch.downgrade()),
+        });
+    });
+    expander
 }
 
 fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
@@ -259,6 +485,28 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     ghostty_row.set_activatable_widget(Some(&ghostty_dropdown));
     group.add(&ghostty_row);
 
+    let unread_color_row = adw::ActionRow::builder()
+        .title("Unread indicator color")
+        .subtitle(
+            "Accent color for unread workspace rows, borders, and tab dots (distinct from blue selection)",
+        )
+        .build();
+    unread_color_row.set_title_lines(1);
+    unread_color_row.set_subtitle_lines(2);
+    let unread_color_dropdown = gtk::DropDown::from_strings(UnreadColor::labels());
+    unread_color_dropdown.set_selected(
+        input
+            .config
+            .borrow()
+            .appearance
+            .unread_color
+            .dropdown_index(),
+    );
+    unread_color_dropdown.set_valign(gtk::Align::Center);
+    unread_color_row.add_suffix(&unread_color_dropdown);
+    unread_color_row.set_activatable_widget(Some(&unread_color_dropdown));
+    group.add(&unread_color_row);
+
     let hover_row = adw::ActionRow::builder()
         .title("Hover terminal focus")
         .subtitle("Focus terminal panes when the mouse pointer enters them")
@@ -304,6 +552,20 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     keep_workspace_open_row.set_activatable_widget(Some(&keep_workspace_open_switch));
     group.add(&keep_workspace_open_row);
 
+    let prompt_workspace_folder_row = adw::ActionRow::builder()
+        .title("Ask for folder on new workspace")
+        .subtitle("Prompt for a folder address when creating a new workspace")
+        .build();
+    prompt_workspace_folder_row.set_title_lines(1);
+    prompt_workspace_folder_row.set_subtitle_lines(2);
+    let prompt_workspace_folder_switch = gtk::Switch::new();
+    prompt_workspace_folder_switch
+        .set_active(input.config.borrow().workspace.prompt_for_folder_on_create);
+    prompt_workspace_folder_switch.set_valign(gtk::Align::Center);
+    prompt_workspace_folder_row.add_suffix(&prompt_workspace_folder_switch);
+    prompt_workspace_folder_row.set_activatable_widget(Some(&prompt_workspace_folder_switch));
+    group.add(&prompt_workspace_folder_row);
+
     let auto_copy_row = adw::ActionRow::builder()
         .title("Copy selection automatically")
         .subtitle("Copy selected terminal text to the regular clipboard")
@@ -316,6 +578,29 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     auto_copy_row.add_suffix(&auto_copy_switch);
     auto_copy_row.set_activatable_widget(Some(&auto_copy_switch));
     group.add(&auto_copy_row);
+
+    let link_destination_row = adw::ActionRow::builder()
+        .title("Open links in")
+        .subtitle("Choose whether terminal links open outside Limux or in a browser tab")
+        .build();
+    link_destination_row.set_title_lines(1);
+    link_destination_row.set_subtitle_lines(2);
+    let link_destination_dropdown =
+        gtk::DropDown::from_strings(&["Default browser", "Browser tab"]);
+    link_destination_dropdown.set_selected(
+        input
+            .config
+            .borrow()
+            .links
+            .open_destination
+            .effective(cfg!(feature = "webkit"))
+            .dropdown_index(),
+    );
+    link_destination_dropdown.set_sensitive(cfg!(feature = "webkit"));
+    link_destination_dropdown.set_valign(gtk::Align::Center);
+    link_destination_row.add_suffix(&link_destination_dropdown);
+    link_destination_row.set_activatable_widget(Some(&link_destination_dropdown));
+    group.add(&link_destination_row);
 
     let scale_row = adw::ActionRow::builder()
         .title("Interface scale")
@@ -349,6 +634,89 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     scale_row.set_activatable_widget(Some(&scale_spin));
     group.add(&scale_row);
 
+    let top_bar_row = adw::ActionRow::builder()
+        .title("Top bar")
+        .subtitle("Show a top bar with workspace indicators. When off, the controls move into the sidebar header. If the sidebar is also hidden, its toggle remains on the leading pane.")
+        .build();
+    top_bar_row.set_title_lines(1);
+    top_bar_row.set_subtitle_lines(4);
+    let top_bar_switch = gtk::Switch::new();
+    top_bar_switch.set_active(input.config.borrow().interface.show_top_bar);
+    top_bar_switch.set_valign(gtk::Align::Center);
+    top_bar_row.add_suffix(&top_bar_switch);
+    top_bar_row.set_activatable_widget(Some(&top_bar_switch));
+    group.add(&top_bar_row);
+
+    let indicators_row = adw::ActionRow::builder()
+        .title("Workspace indicators on the top bar")
+        .subtitle("Show a clickable pill for each workspace in the top bar")
+        .build();
+    indicators_row.set_title_lines(1);
+    indicators_row.set_subtitle_lines(2);
+    let indicators_switch = gtk::Switch::new();
+    indicators_switch.set_active(input.config.borrow().interface.show_workspace_indicators);
+    indicators_switch.set_valign(gtk::Align::Center);
+    indicators_row.add_suffix(&indicators_switch);
+    indicators_row.set_activatable_widget(Some(&indicators_switch));
+    group.add(&indicators_row);
+
+    let tab_activity_row = adw::ActionRow::builder()
+        .title("Tab activity indicators")
+        .subtitle("Show a spinner when background tabs receive terminal output")
+        .build();
+    tab_activity_row.set_title_lines(1);
+    tab_activity_row.set_subtitle_lines(2);
+    let tab_activity_switch = gtk::Switch::new();
+    let show_tab_activity = input.config.borrow().interface.show_tab_activity;
+    tab_activity_switch.set_active(show_tab_activity);
+    tab_activity_switch.set_valign(gtk::Align::Center);
+    tab_activity_row.add_suffix(&tab_activity_switch);
+    tab_activity_row.set_activatable_widget(Some(&tab_activity_switch));
+    group.add(&tab_activity_row);
+
+    let tab_activity_timeout_row = adw::ActionRow::builder()
+        .title("Tab activity timeout")
+        .subtitle("Keep the spinner visible for this many seconds after terminal output")
+        .build();
+    tab_activity_timeout_row.set_title_lines(1);
+    tab_activity_timeout_row.set_subtitle_lines(2);
+    let tab_activity_adjustment = gtk::Adjustment::new(
+        f64::from(input.config.borrow().interface.tab_activity_seconds),
+        f64::from(MIN_TAB_ACTIVITY_SECONDS),
+        f64::from(MAX_TAB_ACTIVITY_SECONDS),
+        1.0,
+        5.0,
+        0.0,
+    );
+    let tab_activity_timeout_spin = gtk::SpinButton::builder()
+        .adjustment(&tab_activity_adjustment)
+        .digits(0)
+        .numeric(true)
+        .valign(gtk::Align::Center)
+        .width_chars(3)
+        .build();
+    tab_activity_timeout_row.add_suffix(&tab_activity_timeout_spin);
+    tab_activity_timeout_row.set_activatable_widget(Some(&tab_activity_timeout_spin));
+    tab_activity_timeout_row.set_sensitive(show_tab_activity);
+    group.add(&tab_activity_timeout_row);
+
+    let controls_row = adw::ActionRow::builder()
+        .title("Window controls side")
+        .subtitle("Place close, minimize, and maximize on the left or right of the top bar (or of the sidebar header when the top bar is off)")
+        .build();
+    controls_row.set_title_lines(1);
+    controls_row.set_subtitle_lines(3);
+    let controls_dropdown = gtk::DropDown::from_strings(&["Left", "Right"]);
+    let initial_side = input.config.borrow().interface.window_controls_side;
+    controls_dropdown.set_selected(match initial_side {
+        WindowControlsSide::Left => 0,
+        WindowControlsSide::Right => 1,
+    });
+    controls_dropdown.set_valign(gtk::Align::Center);
+    controls_row.add_suffix(&controls_dropdown);
+    controls_row.set_activatable_widget(Some(&controls_dropdown));
+    group.add(&controls_row);
+
     page.add(&group);
 
     {
@@ -377,6 +745,30 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
             apply_config_change(&config, &*on_changed, move |c| {
                 c.appearance.ghostty_color_scheme = scheme;
             });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        unread_color_dropdown.connect_selected_notify(move |dropdown| {
+            if syncing.get() {
+                return;
+            }
+            let unread_color = UnreadColor::from_dropdown_index(dropdown.selected());
+            if unread_color == config.borrow().appearance.unread_color {
+                return;
+            }
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.appearance.unread_color = unread_color;
+            })
+            .appearance
+            .unread_color;
+            if dropdown.selected() != effective.dropdown_index() {
+                syncing.set(true);
+                dropdown.set_selected(effective.dropdown_index());
+                syncing.set(false);
+            }
         });
     }
     {
@@ -423,11 +815,67 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     {
         let config = input.config.clone();
         let on_changed = input.on_config_changed.clone();
+        prompt_workspace_folder_switch.connect_active_notify(move |switch| {
+            let prompt_for_folder = switch.is_active();
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.workspace.prompt_for_folder_on_create = prompt_for_folder;
+            });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
         auto_copy_switch.connect_active_notify(move |switch| {
             let copy_selection_to_clipboard = switch.is_active();
             apply_config_change(&config, &*on_changed, move |c| {
                 c.clipboard.copy_selection_to_clipboard = copy_selection_to_clipboard;
             });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        top_bar_switch.connect_active_notify(move |switch| {
+            if syncing.get() {
+                return;
+            }
+            let show_top_bar = switch.is_active();
+            if show_top_bar == config.borrow().interface.show_top_bar {
+                return;
+            }
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.show_top_bar = show_top_bar;
+            })
+            .interface
+            .show_top_bar;
+            if switch.is_active() != effective {
+                syncing.set(true);
+                switch.set_active(effective);
+                syncing.set(false);
+            }
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        link_destination_dropdown.connect_selected_notify(move |dropdown| {
+            if syncing.get() {
+                return;
+            }
+            let destination = LinkOpenDestination::from_dropdown_index(dropdown.selected());
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.links.open_destination = destination;
+            })
+            .links
+            .open_destination
+            .dropdown_index();
+            if dropdown.selected() != effective {
+                syncing.set(true);
+                dropdown.set_selected(effective);
+                syncing.set(false);
+            }
         });
     }
     {
@@ -455,6 +903,115 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
             updating_spin_for_reset.set(true);
             scale_spin.set_value(f64::from(DEFAULT_UI_SCALE) * 100.0);
             updating_spin_for_reset.set(false);
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        indicators_switch.connect_active_notify(move |switch| {
+            if syncing.get() {
+                return;
+            }
+            let show_workspace_indicators = switch.is_active();
+            if show_workspace_indicators == config.borrow().interface.show_workspace_indicators {
+                return;
+            }
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.show_workspace_indicators = show_workspace_indicators;
+            })
+            .interface
+            .show_workspace_indicators;
+            if switch.is_active() != effective {
+                syncing.set(true);
+                switch.set_active(effective);
+                syncing.set(false);
+            }
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let timeout_row = tab_activity_timeout_row.clone();
+        let syncing = Rc::new(Cell::new(false));
+        tab_activity_switch.connect_active_notify(move |switch| {
+            if syncing.get() {
+                return;
+            }
+            let show_tab_activity = switch.is_active();
+            if show_tab_activity == config.borrow().interface.show_tab_activity {
+                timeout_row.set_sensitive(show_tab_activity);
+                return;
+            }
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.show_tab_activity = show_tab_activity;
+            })
+            .interface
+            .show_tab_activity;
+            timeout_row.set_sensitive(effective);
+            if switch.is_active() != effective {
+                syncing.set(true);
+                switch.set_active(effective);
+                syncing.set(false);
+            }
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        tab_activity_timeout_spin.connect_value_changed(move |spin| {
+            if syncing.get() {
+                return;
+            }
+            let seconds = spin.value_as_int().clamp(
+                MIN_TAB_ACTIVITY_SECONDS as i32,
+                MAX_TAB_ACTIVITY_SECONDS as i32,
+            ) as u32;
+            if seconds == config.borrow().interface.tab_activity_seconds {
+                return;
+            }
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.tab_activity_seconds = seconds;
+            })
+            .interface
+            .tab_activity_seconds;
+            if spin.value_as_int() != effective as i32 {
+                syncing.set(true);
+                spin.set_value(f64::from(effective));
+                syncing.set(false);
+            }
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        controls_dropdown.connect_selected_notify(move |dropdown| {
+            if syncing.get() {
+                return;
+            }
+            let side = match dropdown.selected() {
+                0 => WindowControlsSide::Left,
+                _ => WindowControlsSide::Right,
+            };
+            if side == config.borrow().interface.window_controls_side {
+                return;
+            }
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.window_controls_side = side;
+            })
+            .interface
+            .window_controls_side;
+            let selected = match effective {
+                WindowControlsSide::Left => 0,
+                WindowControlsSide::Right => 1,
+            };
+            if dropdown.selected() != selected {
+                syncing.set(true);
+                dropdown.set_selected(selected);
+                syncing.set(false);
+            }
         });
     }
 
@@ -546,6 +1103,318 @@ fn build_notifications_page(input: &SettingsEditorInput) -> gtk::Widget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_config::DEFAULT_TAB_ACTIVITY_SECONDS;
+
+    fn find_row(widget: &gtk::Widget, title: &str) -> Option<adw::ActionRow> {
+        if let Some(row) = widget.downcast_ref::<adw::ActionRow>() {
+            if row.title() == title {
+                return Some(row.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            if let Some(row) = find_row(&widget, title) {
+                return Some(row);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    fn find_control(widget: &gtk::Widget, title: &str) -> Option<gtk::Widget> {
+        find_row(widget, title)?.activatable_widget()
+    }
+
+    fn find_descendant<T: IsA<gtk::Widget>>(widget: &gtk::Widget) -> Option<T> {
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            if let Some(found) = widget
+                .clone()
+                .downcast::<T>()
+                .ok()
+                .or_else(|| find_descendant(&widget))
+            {
+                return Some(found);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn interface_controls_restore_effective_values_after_save_failure() {
+        adw::init().expect("initialize GTK");
+        let config = Rc::new(RefCell::new(AppConfig::default()));
+        let rejected_changes = Rc::new(Cell::new(0));
+        let reject_changes = Rc::new(Cell::new(true));
+        let page = build_general_page(&SettingsEditorInput {
+            config: config.clone(),
+            shortcuts: Rc::new(crate::shortcut_config::default_shortcuts()),
+            on_capture: Rc::new(|_, _| Ok(crate::shortcut_config::default_shortcuts())),
+            on_config_changed: Rc::new({
+                let config = config.clone();
+                let rejected_changes = rejected_changes.clone();
+                let reject_changes = reject_changes.clone();
+                move |previous, _| {
+                    rejected_changes.set(rejected_changes.get() + 1);
+                    if reject_changes.get() {
+                        config.borrow_mut().clone_from(previous);
+                    }
+                }
+            }),
+        });
+        for title in ["Top bar", "Workspace indicators on the top bar"] {
+            let switch = find_control(&page, title)
+                .expect("settings control")
+                .downcast::<gtk::Switch>()
+                .expect("switch");
+            switch.set_active(false);
+            assert!(switch.is_active(), "{title} retained a rejected setting");
+        }
+        let dropdown = find_control(&page, "Window controls side")
+            .expect("settings control")
+            .downcast::<gtk::DropDown>()
+            .expect("dropdown");
+        dropdown.set_selected(0);
+        assert_eq!(dropdown.selected(), 1);
+        let tab_activity_switch = find_control(&page, "Tab activity indicators")
+            .expect("settings control")
+            .downcast::<gtk::Switch>()
+            .expect("switch");
+        let timeout_spin = find_control(&page, "Tab activity timeout")
+            .expect("settings control")
+            .downcast::<gtk::SpinButton>()
+            .expect("spin button");
+        assert_eq!(timeout_spin.adjustment().lower(), 1.0);
+        assert_eq!(timeout_spin.adjustment().upper(), 60.0);
+        tab_activity_switch.set_active(false);
+        assert!(
+            tab_activity_switch.is_active(),
+            "rejected activity toggle was retained"
+        );
+        assert_eq!(
+            timeout_spin.value_as_int(),
+            DEFAULT_TAB_ACTIVITY_SECONDS as i32
+        );
+        timeout_spin.set_value(12.0);
+        assert_eq!(
+            timeout_spin.value_as_int(),
+            DEFAULT_TAB_ACTIVITY_SECONDS as i32
+        );
+        let unread_color = find_control(&page, "Unread indicator color")
+            .expect("settings control")
+            .downcast::<gtk::DropDown>()
+            .expect("dropdown");
+        unread_color.set_selected(UnreadColor::Rose.dropdown_index());
+        assert_eq!(
+            unread_color.selected(),
+            UnreadColor::default().dropdown_index(),
+            "rejected unread color was retained"
+        );
+        assert_eq!(config.borrow().interface, Default::default());
+        assert_eq!(rejected_changes.get(), 6, "rollback must not save again");
+
+        reject_changes.set(false);
+        tab_activity_switch.set_active(false);
+        assert!(!tab_activity_switch.is_active());
+        assert!(!timeout_spin.is_sensitive());
+        assert!(!config.borrow().interface.show_tab_activity);
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn hook_controls_restore_effective_values_after_save_failure() {
+        fn find_expander(widget: &gtk::Widget, title: &str) -> Option<adw::ExpanderRow> {
+            if let Some(row) = widget.downcast_ref::<adw::ExpanderRow>() {
+                if row.title() == title {
+                    return Some(row.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(row) = find_expander(&widget, title) {
+                    return Some(row);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+
+        adw::init().expect("initialize GTK");
+        let config = Rc::new(RefCell::new(AppConfig::default()));
+        let event = GuiHookEvent::OnWorkspaceCreate;
+        let original = GuiHook {
+            enabled: false,
+            command: "before-save".to_string(),
+            show_terminal: true,
+            suppress_default: false,
+        };
+        *config.borrow_mut().hooks.get_mut(event) = original.clone();
+        let rejected_changes = Rc::new(Cell::new(0));
+        let page = build_hooks_page(&SettingsEditorInput {
+            config: config.clone(),
+            shortcuts: Rc::new(crate::shortcut_config::default_shortcuts()),
+            on_capture: Rc::new(|_, _| Ok(crate::shortcut_config::default_shortcuts())),
+            on_config_changed: Rc::new({
+                let config = config.clone();
+                let rejected_changes = rejected_changes.clone();
+                move |previous, _| {
+                    rejected_changes.set(rejected_changes.get() + 1);
+                    config.borrow_mut().clone_from(previous);
+                }
+            }),
+        });
+        let row = find_expander(&page, event.title()).expect("hook row");
+        let row: &gtk::Widget = row.upcast_ref();
+        let enabled = find_control(row, "Enabled")
+            .expect("Enabled switch")
+            .downcast::<gtk::Switch>()
+            .expect("switch");
+        let command = find_row(row, "Command")
+            .and_then(|row| find_descendant::<gtk::Entry>(row.upcast_ref()))
+            .expect("command entry");
+        let show_terminal = find_control(row, "Show in a terminal")
+            .expect("Show in a terminal switch")
+            .downcast::<gtk::Switch>()
+            .expect("switch");
+        let suppress_default = find_control(row, "Skip the default action")
+            .expect("Skip the default action switch")
+            .downcast::<gtk::Switch>()
+            .expect("switch");
+
+        enabled.set_active(true);
+        assert!(!enabled.is_active(), "rejected enabled change was retained");
+        command.set_text("rejected-command");
+        assert_eq!(command.text(), original.command);
+        show_terminal.set_active(false);
+        assert!(
+            show_terminal.is_active(),
+            "rejected terminal change was retained"
+        );
+        suppress_default.set_active(true);
+        assert!(
+            !suppress_default.is_active(),
+            "rejected suppress-default change was retained"
+        );
+        assert_eq!(
+            row.downcast_ref::<adw::ExpanderRow>().unwrap().subtitle(),
+            gui_hook_subtitle(&original)
+        );
+        assert_eq!(config.borrow().hooks.get(event), &original);
+        assert_eq!(
+            rejected_changes.get(),
+            4,
+            "refreshing controls must not save the rejected values again"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn hook_rows_show_socket_changes_without_saving_them_again() {
+        fn find_expander(widget: &gtk::Widget, title: &str) -> Option<adw::ExpanderRow> {
+            if let Some(row) = widget.downcast_ref::<adw::ExpanderRow>() {
+                if row.title() == title {
+                    return Some(row.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(row) = find_expander(&widget, title) {
+                    return Some(row);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+
+        adw::init().expect("initialize GTK");
+        let config = Rc::new(RefCell::new(AppConfig::default()));
+        for event in GuiHookEvent::ALL {
+            config.borrow_mut().hooks.get_mut(event).command =
+                format!("{} before-socket", event.as_str());
+        }
+        let saves = Rc::new(Cell::new(0));
+        let page = build_hooks_page(&SettingsEditorInput {
+            config: config.clone(),
+            shortcuts: Rc::new(crate::shortcut_config::default_shortcuts()),
+            on_capture: Rc::new(|_, _| Ok(crate::shortcut_config::default_shortcuts())),
+            on_config_changed: Rc::new({
+                let saves = saves.clone();
+                move |_, _| saves.set(saves.get() + 1)
+            }),
+        });
+
+        for event in GuiHookEvent::ALL {
+            let row = find_expander(&page, event.title())
+                .unwrap_or_else(|| panic!("{} row", event.title()));
+            let row: &gtk::Widget = row.upcast_ref();
+            let switch = |title| {
+                find_control(row, title).and_then(|control| control.downcast::<gtk::Switch>().ok())
+            };
+            let enabled = switch("Enabled").expect("Enabled switch");
+            let terminal = switch("Show in a terminal").expect("terminal switch");
+            let suppress = switch("Skip the default action");
+            // An after-* hook runs once Limux's action is done: nothing to skip.
+            assert_eq!(suppress.is_some(), event.can_skip_default(), "{event:?}");
+            let command = find_row(row, "Command")
+                .and_then(|row| find_descendant::<gtk::Entry>(row.upcast_ref()))
+                .expect("command entry");
+
+            // What the socket handler does after saving a change.
+            let saves_before = saves.get();
+            let hooks = {
+                let mut config = config.borrow_mut();
+                let hook = config.hooks.get_mut(event);
+                hook.command = format!("{} --force", event.as_str());
+                hook.enabled = false;
+                hook.show_terminal = true;
+                hook.suppress_default = event.can_skip_default();
+                config.hooks.clone()
+            };
+            refresh_gui_hook_rows(&hooks);
+            assert_eq!(command.text(), format!("{} --force", event.as_str()));
+            assert!(!enabled.is_active());
+            assert!(terminal.is_active());
+            if let Some(suppress) = &suppress {
+                assert!(suppress.is_active());
+            }
+            assert_eq!(saves.get(), saves_before, "a refresh must not save again");
+            assert_eq!(config.borrow().hooks, hooks);
+
+            // The user's own changes still save, to this hook only.
+            enabled.set_active(true);
+            assert_eq!(saves.get(), saves_before + 1);
+            assert!(config.borrow().hooks.get(event).enabled);
+            let mut others = hooks.clone();
+            others.get_mut(event).enabled = true;
+            assert_eq!(config.borrow().hooks, others);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn hooks_is_the_second_settings_tab() {
+        adw::init().expect("initialize GTK");
+        let window = adw::Window::new();
+        let content = build_settings_window_content(
+            &window,
+            SettingsEditorInput {
+                config: Rc::new(RefCell::new(AppConfig::default())),
+                shortcuts: Rc::new(crate::shortcut_config::default_shortcuts()),
+                on_capture: Rc::new(|_, _| Ok(crate::shortcut_config::default_shortcuts())),
+                on_config_changed: Rc::new(|_, _| {}),
+            },
+        );
+        let stack = find_descendant::<adw::ViewStack>(&content).expect("settings stack");
+        let pages = stack.pages();
+        let names: Vec<String> = (0..pages.n_items())
+            .filter_map(|index| pages.item(index))
+            .filter_map(|page| page.downcast::<adw::ViewStackPage>().ok())
+            .filter_map(|page| page.name().map(|name| name.to_string()))
+            .collect();
+        assert_eq!(names, ["general", "hooks", "notifications", "keybindings"]);
+    }
 
     #[test]
     fn apply_config_change_returns_reentrant_config_state() {

@@ -10,7 +10,7 @@ Limux has **two control servers**:
 
 2. **Embedded bridge inside `limux-host-linux`** — `control_bridge.rs` only
    routes a narrow subset of methods to the GTK main loop. Supports
-   `system.ping`, `system.identify`, `workspace.{current,list,create,
+   `system.ping`, `system.identify`, `window.activate`, `workspace.{current,list,create,
    select,rename,close}`, `pane.list`, `pane.surfaces`, `surface.list`,
    `pane.create` for terminal self-spawn, `surface.send_text`,
    `surface.send_key`, `surface.read_text`, `surface.health`, and
