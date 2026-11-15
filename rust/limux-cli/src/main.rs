@@ -684,14 +684,21 @@ async fn call_in_workspace_scope(
 
 async fn browser_call(
     client: &mut Client,
-    surface: Option<String>,
+    workspace: Option<&str>,
+    surface: Option<&str>,
     method: &str,
     mut params: Map<String, Value>,
 ) -> Result<Value> {
     if let Some(surface) = surface {
-        params.insert("surface_id".to_string(), Value::String(surface));
+        params.insert("surface_id".to_string(), Value::String(surface.to_string()));
     }
-    client.call(method, Value::Object(params)).await
+    call_in_workspace_scope(
+        client,
+        workspace.map(str::to_string),
+        method,
+        Value::Object(params),
+    )
+    .await
 }
 
 fn window_activation_params(activation_token: Option<&str>, startup_id: Option<&str>) -> Value {
@@ -3363,25 +3370,91 @@ fn ensure_placeholder_screenshot_file(path: &Path) -> Result<()> {
     }
 }
 
-async fn run_browser(
-    client: &mut Client,
-    args: &[String],
-    json_output: bool,
-) -> Result<CommandOutput> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserInvocation {
+    browser_args: Vec<String>,
+    local_json: bool,
+    workspace: Option<String>,
+    surface: Option<String>,
+    subcommand: String,
+    rest: Vec<String>,
+}
+
+fn is_browser_subcommand(token: &str) -> bool {
+    matches!(
+        token,
+        "open"
+            | "open-split"
+            | "new"
+            | "identify"
+            | "url"
+            | "get-url"
+            | "goto"
+            | "navigate"
+            | "back"
+            | "forward"
+            | "reload"
+            | "wait"
+            | "snapshot"
+            | "screenshot"
+            | "find"
+            | "frame"
+            | "click"
+            | "dblclick"
+            | "hover"
+            | "focus"
+            | "focus-webview"
+            | "is-webview-focused"
+            | "check"
+            | "uncheck"
+            | "scroll-into-view"
+            | "type"
+            | "fill"
+            | "press"
+            | "keydown"
+            | "keyup"
+            | "select"
+            | "scroll"
+            | "eval"
+            | "get"
+            | "is"
+            | "cookies"
+            | "storage"
+            | "tab"
+            | "addscript"
+            | "addinitscript"
+            | "addstyle"
+            | "console"
+            | "errors"
+            | "highlight"
+            | "state"
+            | "viewport"
+            | "dialog"
+            | "download"
+            | "input-mouse"
+            | "input-keyboard"
+            | "input-touch"
+    )
+}
+
+fn parse_browser_invocation(args: &[String], json_output: bool) -> Result<BrowserInvocation> {
     let mut browser_args = args.to_vec();
     let mut local_json = json_output;
 
-    loop {
-        if browser_args.last().map(|s| s.as_str()) == Some("--json") {
-            local_json = true;
-            browser_args.pop();
-            continue;
-        }
-        break;
+    while browser_args.last().map(|s| s.as_str()) == Some("--json") {
+        local_json = true;
+        browser_args.pop();
     }
 
     let workspace = parse_opt(&browser_args, "--workspace");
-    let mut surface = parse_opt(&browser_args, "--surface");
+    if let Some(ref ws) = workspace {
+        if ws.trim().is_empty() {
+            bail!("--workspace requires a non-empty target");
+        }
+    } else if parse_flag(&browser_args, "--workspace") {
+        bail!("--workspace requires a non-empty target");
+    }
+    let mut surface = parse_terminal_surface(&browser_args)?;
 
     let mut positional: Vec<String> = Vec::new();
     let mut skip = false;
@@ -3392,7 +3465,8 @@ async fn run_browser(
         }
         match arg.as_str() {
             "--workspace" | "--surface" | "--id-format" | "--timeout-ms" | "--load-state"
-            | "--out" => {
+            | "--out" | "--selector" | "--text" | "--attr" | "--property" | "--name"
+            | "--value" => {
                 if idx + 1 < browser_args.len() {
                     skip = true;
                 }
@@ -3408,22 +3482,42 @@ async fn run_browser(
 
     let mut pos_idx = 0usize;
     let first = positional[0].clone();
-    let verbs_without_surface = ["open", "open-split", "new", "identify"];
-
-    if !verbs_without_surface.contains(&first.as_str()) {
-        if !first.contains(':') && !first.contains('-') {
-            // probably still subcommand
-        } else {
-            surface = Some(first);
-            pos_idx = 1;
-        }
+    if surface.is_none()
+        && !is_browser_subcommand(&first)
+        && (first.contains(':') || first.contains('-'))
+    {
+        surface = Some(first);
+        pos_idx = 1;
     }
 
     if pos_idx >= positional.len() {
         bail!("browser requires a subcommand");
     }
-    let sub = positional[pos_idx].clone();
-    let rest = positional[(pos_idx + 1)..].to_vec();
+
+    Ok(BrowserInvocation {
+        browser_args,
+        local_json,
+        workspace,
+        surface,
+        subcommand: positional[pos_idx].clone(),
+        rest: positional[(pos_idx + 1)..].to_vec(),
+    })
+}
+
+async fn run_browser(
+    client: &mut Client,
+    args: &[String],
+    json_output: bool,
+) -> Result<CommandOutput> {
+    let BrowserInvocation {
+        browser_args,
+        local_json,
+        workspace,
+        surface,
+        subcommand: sub,
+        rest,
+    } = parse_browser_invocation(args, json_output)?;
+    let ws = workspace.as_deref();
 
     let output = match sub.as_str() {
         "open" | "open-split" | "new" => {
@@ -3431,8 +3525,8 @@ async fn run_browser(
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "about:blank".to_string());
-            if let Some(surface) = surface.clone() {
-                let payload = browser_call(client, Some(surface), "browser.navigate", {
+            if let Some(surface) = surface.as_deref() {
+                let payload = browser_call(client, ws, Some(surface), "browser.navigate", {
                     let mut p = Map::new();
                     p.insert("url".to_string(), Value::String(url));
                     p
@@ -3451,10 +3545,14 @@ async fn run_browser(
             }
         }
         "url" | "get-url" => {
-            let sid = surface
-                .clone()
-                .ok_or_else(|| anyhow!("browser url requires a surface"))?;
-            let payload = browser_call(client, Some(sid), "browser.url.get", Map::new()).await?;
+            let payload = browser_call(
+                client,
+                ws,
+                surface.as_deref(),
+                "browser.url.get",
+                Map::new(),
+            )
+            .await?;
             if local_json {
                 CommandOutput::Json(payload)
             } else {
@@ -3462,21 +3560,22 @@ async fn run_browser(
             }
         }
         "goto" | "navigate" => {
-            let sid = surface
-                .clone()
-                .ok_or_else(|| anyhow!("browser navigate requires a surface"))?;
             let url = rest
                 .first()
                 .cloned()
                 .ok_or_else(|| anyhow!("browser navigate requires a URL"))?;
-            let payload = browser_call(client, Some(sid.clone()), "browser.navigate", {
+            let payload = browser_call(client, ws, surface.as_deref(), "browser.navigate", {
                 let mut p = Map::new();
                 p.insert("url".to_string(), Value::String(url));
                 p
             })
             .await?;
             if parse_flag(&browser_args, "--snapshot-after") {
-                let snap = browser_call(client, Some(sid), "browser.snapshot", Map::new()).await?;
+                let sid = surface.as_deref().ok_or_else(|| {
+                    anyhow!("browser navigate --snapshot-after requires a surface")
+                })?;
+                let snap =
+                    browser_call(client, ws, Some(sid), "browser.snapshot", Map::new()).await?;
                 if local_json {
                     let mut merged = payload;
                     if let Some(obj) = merged.as_object_mut() {
@@ -3493,9 +3592,14 @@ async fn run_browser(
                 CommandOutput::Json(payload)
             }
         }
+        "back" | "forward" | "reload" => {
+            let method = format!("browser.{}", sub);
+            let payload = browser_call(client, ws, surface.as_deref(), &method, Map::new()).await?;
+            CommandOutput::Json(payload)
+        }
         "wait" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser wait requires a surface"))?;
             let mut p = Map::new();
             if let Some(selector) = parse_opt(&browser_args, "--selector") {
@@ -3506,7 +3610,7 @@ async fn run_browser(
                     p.insert("timeout_ms".to_string(), Value::Number(ms.into()));
                 }
             }
-            let payload = browser_call(client, Some(sid), "browser.wait", p).await?;
+            let payload = browser_call(client, ws, Some(sid), "browser.wait", p).await?;
             if local_json {
                 CommandOutput::Json(payload)
             } else {
@@ -3515,9 +3619,10 @@ async fn run_browser(
         }
         "snapshot" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser snapshot requires a surface"))?;
-            let payload = browser_call(client, Some(sid), "browser.snapshot", Map::new()).await?;
+            let payload =
+                browser_call(client, ws, Some(sid), "browser.snapshot", Map::new()).await?;
             if local_json {
                 CommandOutput::Json(payload)
             } else {
@@ -3543,10 +3648,10 @@ async fn run_browser(
         }
         "screenshot" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser screenshot requires a surface"))?;
             let mut payload =
-                browser_call(client, Some(sid), "browser.screenshot", Map::new()).await?;
+                browser_call(client, ws, Some(sid), "browser.screenshot", Map::new()).await?;
             let out = parse_opt(&browser_args, "--out");
             let mut path = match get_string(&payload, &["path"]) {
                 Some(path) => path,
@@ -3576,7 +3681,7 @@ async fn run_browser(
         }
         "find" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser find requires a surface"))?;
             let locator = rest.first().cloned().unwrap_or_else(|| "text".to_string());
             let value = rest.get(1).cloned().unwrap_or_default();
@@ -3601,7 +3706,7 @@ async fn run_browser(
                     params.insert(locator.clone(), Value::String(value));
                 }
             }
-            let payload = browser_call(client, Some(sid), &method, params).await?;
+            let payload = browser_call(client, ws, Some(sid), &method, params).await?;
             if local_json {
                 CommandOutput::Json(payload)
             } else {
@@ -3612,13 +3717,13 @@ async fn run_browser(
         }
         "frame" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser frame requires a surface"))?;
             let target = rest.first().cloned().unwrap_or_else(|| "main".to_string());
             let payload = if target == "main" {
-                browser_call(client, Some(sid), "browser.frame.main", Map::new()).await?
+                browser_call(client, ws, Some(sid), "browser.frame.main", Map::new()).await?
             } else {
-                browser_call(client, Some(sid), "browser.frame.select", {
+                browser_call(client, ws, Some(sid), "browser.frame.select", {
                     let mut p = Map::new();
                     p.insert("selector".to_string(), Value::String(target));
                     p
@@ -3629,12 +3734,12 @@ async fn run_browser(
         }
         "click" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser click requires a surface"))?;
             let selector = parse_opt(&browser_args, "--selector")
                 .or_else(|| rest.first().cloned())
                 .ok_or_else(|| anyhow!("browser click requires a selector"))?;
-            let payload = browser_call(client, Some(sid), "browser.click", {
+            let payload = browser_call(client, ws, Some(sid), "browser.click", {
                 let mut p = Map::new();
                 p.insert("selector".to_string(), Value::String(selector));
                 p
@@ -3644,7 +3749,7 @@ async fn run_browser(
         }
         "fill" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser fill requires a surface"))?;
             let selector = parse_opt(&browser_args, "--selector")
                 .or_else(|| rest.first().cloned())
@@ -3652,7 +3757,7 @@ async fn run_browser(
             let text = parse_opt(&browser_args, "--text")
                 .or_else(|| rest.get(1).cloned())
                 .unwrap_or_default();
-            let payload = browser_call(client, Some(sid), "browser.fill", {
+            let payload = browser_call(client, ws, Some(sid), "browser.fill", {
                 let mut p = Map::new();
                 p.insert("selector".to_string(), Value::String(selector));
                 p.insert("text".to_string(), Value::String(text));
@@ -3661,7 +3766,7 @@ async fn run_browser(
             .await?;
             if parse_flag(&browser_args, "--snapshot-after") {
                 let snap =
-                    browser_call(client, surface.clone(), "browser.snapshot", Map::new()).await?;
+                    browser_call(client, ws, Some(sid), "browser.snapshot", Map::new()).await?;
                 if local_json {
                     let mut merged = payload;
                     if let Some(obj) = merged.as_object_mut() {
@@ -3680,7 +3785,7 @@ async fn run_browser(
         }
         "get" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser get requires a surface"))?;
             let get_verb = rest.first().cloned().unwrap_or_else(|| "url".to_string());
             let method = match get_verb.as_str() {
@@ -3709,7 +3814,7 @@ async fn run_browser(
             if let Some(property) = parse_opt(&browser_args, "--property") {
                 p.insert("property".to_string(), Value::String(property));
             }
-            let payload = browser_call(client, Some(sid), &method, p).await?;
+            let payload = browser_call(client, ws, Some(sid), &method, p).await?;
             if local_json {
                 CommandOutput::Json(payload)
             } else {
@@ -3720,7 +3825,7 @@ async fn run_browser(
         }
         "cookies" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser cookies requires a surface"))?;
             let op = rest.first().cloned().unwrap_or_else(|| "get".to_string());
             let method = match op.as_str() {
@@ -3744,12 +3849,12 @@ async fn run_browser(
             {
                 p.insert("value".to_string(), Value::String(value));
             }
-            let payload = browser_call(client, Some(sid), method, p).await?;
+            let payload = browser_call(client, ws, Some(sid), method, p).await?;
             CommandOutput::Json(payload)
         }
         "storage" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser storage requires a surface"))?;
             if rest.len() < 2 {
                 bail!("browser storage requires <local|session> <get|set|clear>");
@@ -3770,12 +3875,12 @@ async fn run_browser(
             if let Some(value) = rest.get(3) {
                 p.insert("value".to_string(), Value::String(value.clone()));
             }
-            let payload = browser_call(client, Some(sid), method, p).await?;
+            let payload = browser_call(client, ws, Some(sid), method, p).await?;
             CommandOutput::Json(payload)
         }
         "tab" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser tab requires a surface"))?;
             let tab_verb = rest.first().cloned().unwrap_or_else(|| "list".to_string());
             let (method, p) = match tab_verb.as_str() {
@@ -3809,12 +3914,12 @@ async fn run_browser(
                 }
                 _ => bail!("Unsupported browser tab subcommand: {}", tab_verb),
             };
-            let payload = browser_call(client, Some(sid), method, p).await?;
+            let payload = browser_call(client, ws, Some(sid), method, p).await?;
             CommandOutput::Json(payload)
         }
         "addscript" | "addinitscript" | "addstyle" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser {} requires a surface", sub))?;
             let content = rest.join(" ");
             if content.trim().is_empty() {
@@ -3824,24 +3929,24 @@ async fn run_browser(
             let method = format!("browser.{}", sub);
             let mut p = Map::new();
             p.insert(field.to_string(), Value::String(content));
-            let payload = browser_call(client, Some(sid), &method, p).await?;
+            let payload = browser_call(client, ws, Some(sid), &method, p).await?;
             CommandOutput::Json(payload)
         }
         "console" | "errors" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser {} requires a surface", sub))?;
             let op = rest.first().cloned().unwrap_or_else(|| "list".to_string());
             let method = format!("browser.{}.{}", sub, op);
-            let payload = browser_call(client, Some(sid), &method, Map::new()).await?;
+            let payload = browser_call(client, ws, Some(sid), &method, Map::new()).await?;
             CommandOutput::Json(payload)
         }
         "highlight" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser highlight requires a surface"))?;
             let selector = rest.first().cloned().unwrap_or_default();
-            let payload = browser_call(client, Some(sid), "browser.highlight", {
+            let payload = browser_call(client, ws, Some(sid), "browser.highlight", {
                 let mut p = Map::new();
                 p.insert("selector".to_string(), Value::String(selector));
                 p
@@ -3851,7 +3956,7 @@ async fn run_browser(
         }
         "state" => {
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser state requires a surface"))?;
             let op = rest.first().cloned().unwrap_or_else(|| "save".to_string());
             let path = rest
@@ -3863,7 +3968,7 @@ async fn run_browser(
                 "load" => "browser.state.load",
                 _ => bail!("Unsupported browser state subcommand: {}", op),
             };
-            let payload = browser_call(client, Some(sid), method, {
+            let payload = browser_call(client, ws, Some(sid), method, {
                 let mut p = Map::new();
                 p.insert("path".to_string(), Value::String(path));
                 p
@@ -3877,10 +3982,10 @@ async fn run_browser(
         _ => {
             // Generic passthrough to browser.<sub>
             let sid = surface
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("browser {} requires a surface", sub))?;
-            let method = format!("browser.{}", sub);
-            let payload = browser_call(client, Some(sid), &method, Map::new()).await?;
+            let method = format!("browser.{}", sub.replace('-', "_"));
+            let payload = browser_call(client, ws, Some(sid), &method, Map::new()).await?;
             CommandOutput::Json(payload)
         }
     };
@@ -4549,31 +4654,31 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(get_string(&payload, &["text"]).unwrap_or_default())
             }
         }
-        "browser" => return run_browser(client, args, opts.json_output).await,
+        "browser" => run_browser(client, args, opts.json_output).await?,
         "open-browser" => {
             let mut bridged = vec!["open".to_string()];
             bridged.extend(args.iter().cloned());
-            return run_browser(client, &bridged, opts.json_output).await;
+            run_browser(client, &bridged, opts.json_output).await?
         }
         "navigate-browser" => {
             let mut bridged = vec!["navigate".to_string()];
             bridged.extend(args.iter().cloned());
-            return run_browser(client, &bridged, opts.json_output).await;
+            run_browser(client, &bridged, opts.json_output).await?
         }
         "browser-back" => {
             let mut bridged = vec!["back".to_string()];
             bridged.extend(args.iter().cloned());
-            return run_browser(client, &bridged, opts.json_output).await;
+            run_browser(client, &bridged, opts.json_output).await?
         }
         "browser-forward" => {
             let mut bridged = vec!["forward".to_string()];
             bridged.extend(args.iter().cloned());
-            return run_browser(client, &bridged, opts.json_output).await;
+            run_browser(client, &bridged, opts.json_output).await?
         }
         "browser-reload" => {
             let mut bridged = vec!["reload".to_string()];
             bridged.extend(args.iter().cloned());
-            return run_browser(client, &bridged, opts.json_output).await;
+            run_browser(client, &bridged, opts.json_output).await?
         }
         "pipe-pane" | "wait-for" | "find-window" | "last-window" | "next-window"
         | "previous-window" | "swap-pane" | "break-pane" | "join-pane" | "last-pane"
@@ -6292,5 +6397,56 @@ mod new_pane_tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn browser_invocation_preserves_hyphenated_subcommands_and_positional_surfaces() {
+        let flagged = parse_browser_invocation(
+            &args(&[
+                "--surface",
+                "15:36580cc0-ce6a-47a7-9a02-aeea222d4d38",
+                "get-url",
+            ]),
+            false,
+        )
+        .expect("flagged get-url");
+        assert_eq!(
+            flagged.surface.as_deref(),
+            Some("15:36580cc0-ce6a-47a7-9a02-aeea222d4d38")
+        );
+        assert_eq!(flagged.subcommand, "get-url");
+        assert!(flagged.rest.is_empty());
+
+        let positional_surface = parse_browser_invocation(
+            &args(&[
+                "15:36580cc0-ce6a-47a7-9a02-aeea222d4d38",
+                "get-url",
+                "--json",
+            ]),
+            false,
+        )
+        .expect("positional surface get-url");
+        assert_eq!(
+            positional_surface.surface.as_deref(),
+            Some("15:36580cc0-ce6a-47a7-9a02-aeea222d4d38")
+        );
+        assert_eq!(positional_surface.subcommand, "get-url");
+        assert!(positional_surface.local_json);
+
+        let workspace_scoped =
+            parse_browser_invocation(&args(&["--workspace", "ws-1", "focus-webview"]), false)
+                .expect("workspace focus-webview");
+        assert_eq!(workspace_scoped.workspace.as_deref(), Some("ws-1"));
+        assert_eq!(workspace_scoped.surface, None);
+        assert_eq!(workspace_scoped.subcommand, "focus-webview");
+
+        let click = parse_browser_invocation(
+            &args(&["--surface", "surface:3", "click", "--selector", "#go"]),
+            false,
+        )
+        .expect("click with --selector");
+        assert_eq!(click.surface.as_deref(), Some("surface:3"));
+        assert_eq!(click.subcommand, "click");
+        assert!(click.rest.is_empty());
     }
 }
